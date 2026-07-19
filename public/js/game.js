@@ -11,7 +11,7 @@ const I18n = window.XRRCI18n;
 const ShareCore = window.XRRCShareCore;
 const TrackCore = window.XRRCTrackCore;
 const RaceCore = window.XRRCRaceCore;
-const COURSE_SCALE = 1.42;
+const COURSE_SCALE = 2.15;
 const XR_WORLD_SCALE = 0.4;
 const MAX_FRAME_CATCHUP = 0.25;
 const MAX_SIMULATION_STEP = 0.05;
@@ -25,29 +25,8 @@ const START_GRID = Object.freeze({
   z: BASE_START_GRID.z * COURSE_SCALE,
   heading: BASE_START_GRID.heading,
 });
-const JUMP_ZONES = Object.freeze([
-  [-1.55, 0.08, 0.46, 0.5],
-  [-0.42, -0.16, 0.34, 0.32],
-  [-0.42, 0.32, 0.34, 0.32],
-  [1.95, 0.08, 0.42, 0.56],
-].map(([x, z, radius, lift]) => Object.freeze({
-  x: x * COURSE_SCALE,
-  z: z * COURSE_SCALE,
-  radius: radius * COURSE_SCALE,
-  lift,
-})));
-const STUNT_LANE = Object.freeze({
-  x: 0,
-  z: 0.08 * COURSE_SCALE,
-  halfLength: 2.275 * COURSE_SCALE,
-  halfWidth: 0.36 * COURSE_SCALE,
-  rotation: 0.035,
-});
-const STUNT_LOOP = Object.freeze({
-  centerX: 0.95 * COURSE_SCALE,
-  centerZ: 0.08 * COURSE_SCALE,
-  radius: 0.5 * COURSE_SCALE,
-});
+// Ramps and the vertical loop are derived per-circuit in _computeCourseFeatures
+// so they land on the racing line instead of a separate infield strip.
 const COURSE_SAMPLE_COUNT = 240;
 const RACE_CHECKPOINTS = Object.freeze([0.22, 0.47, 0.72]);
 const RACE_SAVE_KEY = 'xrrc-race-records-v1';
@@ -1496,6 +1475,7 @@ class Game {
     this.thumbnailTask = null;
     this.cameraTarget = new THREE.Vector3();
     this.cameraOffset = new THREE.Vector3();
+    this.overviewCamera = Boolean(window.XRRC_OVERVIEW_CAMERA);
     this.staticColliders = [];
     this.trackSamples = [];
     this.lastSafePose = { ...START_GRID, y: Core.getVehicleSpec(props.vehicle).rideHeight };
@@ -2043,8 +2023,115 @@ class Game {
       position,
       this.trackSamples,
       this.roadWidth,
-      STUNT_LANE
+      null
     );
+  }
+
+  // Screenshot/demo autopilot: steer toward a point further along the course so
+  // the car actually laps a circuit with real corners. stepCar subtracts
+  // steering from heading, hence the negated correction.
+  _updateDemoAutopilot(surface) {
+    if (!window.XRRC_DEMO_AUTOPILOT || !this.trackSamples) return;
+    const count = this.trackSamples.length;
+    const lookahead = Math.round(count * 0.05) * (this.raceDirection || 1);
+    const index = Math.round(surface.progress * count) % count;
+    const target = this.trackSamples[((index + lookahead) % count + count) % count];
+    const car = this.localCar.group.position;
+    const desired = Math.atan2(-(target.x - car.x), -(target.z - car.z));
+    let error = desired - this.localCar.group.rotation.y;
+    while (error > Math.PI) error -= Math.PI * 2;
+    while (error < -Math.PI) error += Math.PI * 2;
+    window.XRRC_DEMO_INPUT = {
+      throttle: 0.9,
+      steering: Math.max(-1, Math.min(1, -error * 1.8)),
+    };
+  }
+
+  // Stunt features used to sit on a straight strip through the infield, which
+  // meant leaving the racing line to reach them. They are now derived from the
+  // circuit itself so every lap runs through them.
+  //
+  // stepLoop() drives the car along world x with a constant z, so the vertical
+  // loop can only be placed where the course runs parallel to the x axis. That
+  // is exactly the start/finish straight, so we score each sample for
+  // x-alignment plus straightness and take the best window clear of the grid.
+  _computeCourseFeatures() {
+    const samples = this.trackSamples;
+    const count = samples.length;
+    const tangentAt = (index) => {
+      const before = samples[(index - 3 + count) % count];
+      const after = samples[(index + 3) % count];
+      const dx = after.x - before.x;
+      const dz = after.z - before.z;
+      const length = Math.hypot(dx, dz) || 1;
+      return { x: dx / length, z: dz / length };
+    };
+
+    const startIndex = Math.round(this.startProgress * count) % count;
+    const gridClearance = Math.round(count * 0.06);
+    const window = Math.max(3, Math.round(count * 0.03));
+
+    let bestScore = -Infinity;
+    let bestIndex = -1;
+    for (let index = 0; index < count; index += 1) {
+      const fromGrid = Math.min(
+        (index - startIndex + count) % count,
+        (startIndex - index + count) % count
+      );
+      if (fromGrid < gridClearance) continue;
+      const centre = tangentAt(index);
+      // The car is carried along x at a fixed z, so a loop on a curve spits it
+      // off the road. Straightness across the whole window dominates the score;
+      // x-alignment only breaks ties between equally straight candidates.
+      let deviation = 0;
+      for (let offset = -window; offset <= window; offset += 1) {
+        const tangent = tangentAt((index + offset + count) % count);
+        deviation = Math.max(
+          deviation,
+          Math.abs(tangent.z - centre.z) + Math.abs(tangent.x - centre.x)
+        );
+      }
+      const score = Math.abs(centre.x) - deviation * 10;
+      if (score > bestScore) {
+        bestScore = score;
+        bestIndex = index;
+      }
+    }
+
+    const loopSample = samples[bestIndex >= 0 ? bestIndex : startIndex];
+    this.loopFeature = Object.freeze({
+      centerX: loopSample.x,
+      centerZ: loopSample.z,
+      radius: 0.5 * COURSE_SCALE,
+      progress: (bestIndex >= 0 ? bestIndex : startIndex) / count,
+    });
+
+    // Four ramps spread around the lap, kept clear of the grid and the loop.
+    const loopProgress = this.loopFeature.progress;
+    const offsets = [0.18, 0.38, 0.6, 0.82];
+    this.jumpZones = Object.freeze(offsets.map((offset, ordinal) => {
+      let progress = (this.startProgress + offset * this.raceDirection + 1) % 1;
+      const apart = Math.abs(((progress - loopProgress + 1.5) % 1) - 0.5);
+      if (apart < 0.07) progress = (progress + 0.09) % 1;
+      const index = Math.round(progress * count) % count;
+      const sample = samples[index];
+      const tangent = tangentAt(index);
+      return Object.freeze({
+        x: sample.x,
+        z: sample.z,
+        radius: (ordinal % 2 === 0 ? 0.44 : 0.36) * COURSE_SCALE,
+        lift: ordinal % 2 === 0 ? 0.5 : 0.34,
+        progress,
+        tangentX: tangent.x,
+        tangentZ: tangent.z,
+        // Rotating a mesh by theta about Y sends its local +X to
+        // (cos theta, -sin theta) in the xz plane, so aligning the ramp's long
+        // axis with the course tangent needs atan2(-tz, tx).
+        meshRotationY: Math.atan2(-tangent.z, tangent.x),
+        // Car headings use forward = (-sin h, -cos h).
+        carHeading: Math.atan2(-tangent.x, -tangent.z),
+      });
+    }));
   }
 
   _buildTrack() {
@@ -2075,6 +2162,7 @@ class Game {
       0.45
     );
     this._buildCourseSamples();
+    this._computeCourseFeatures();
 
     const shoulder = this._addMesh(
       this._createRoadGeometry(this.trackCurve, localRoadWidth + 0.24 / COURSE_SCALE),
@@ -2091,7 +2179,6 @@ class Game {
     road.castShadow = false;
     this._addCourseDetails(this.trackCurve, white, red, curbB, localRoadWidth);
     this._addStartGrid(white, dark);
-    this._addStuntLane(dirt, yellow, dark);
     this._addBarrier(-2.55, -2.92, 1.4, 0.08, red, white);
     this._addBarrier(2.55, 2.92, 1.2, -0.08, yellow, dark);
     this._addTireWall(-3.95, 0.35, 0.9, Math.PI / 2, dark);
@@ -2208,44 +2295,6 @@ class Game {
     const geometry = new THREE.BoxGeometry(0.11, 0.014, 0.11);
     this._addInstances(geometry, white, whiteTiles, { castShadow: false });
     this._addInstances(geometry.clone(), dark, darkTiles, { castShadow: false });
-  }
-
-  _addStuntLane(dirt, yellow, dark) {
-    const stuntSurface = this._addMesh(
-      new THREE.BoxGeometry(4.55, 0.016, 0.72),
-      dirt,
-      new THREE.Vector3(0, 0.004, 0.08),
-      new THREE.Euler(0, -0.035, 0)
-    );
-    stuntSurface.castShadow = false;
-    const laneMarkers = [];
-    for (let index = -6; index <= 6; index += 1) {
-      if (index % 2 === 0) {
-        laneMarkers.push({
-          position: new THREE.Vector3(index * 0.31, 0.02, 0.08),
-        });
-      }
-    }
-    this._addInstances(
-      new THREE.BoxGeometry(0.2, 0.012, 0.025),
-      yellow,
-      laneMarkers,
-      { castShadow: false }
-    );
-    const firstEdge = this._addMesh(
-      new THREE.BoxGeometry(4.75, 0.03, 0.035),
-      dark,
-      new THREE.Vector3(0, 0.02, -0.3),
-      new THREE.Euler(0, -0.035, 0)
-    );
-    firstEdge.castShadow = false;
-    const secondEdge = this._addMesh(
-      new THREE.BoxGeometry(4.75, 0.03, 0.035),
-      dark,
-      new THREE.Vector3(0, 0.02, 0.46),
-      new THREE.Euler(0, -0.035, 0)
-    );
-    secondEdge.castShadow = false;
   }
 
   _addBarrier(x, z, length, rotation, firstMaterial, secondMaterial) {
@@ -2717,43 +2766,54 @@ class Game {
     }
   }
 
+  // Ramps ride the racing line, so each one is rotated to face along the
+  // course tangent at its progress instead of sitting on a fixed axis.
   _addJump(red, yellow) {
-    const ramps = [
-      [-1.55, 0.08, 1, 0.31],
-      [-0.42, -0.16, 0.7, 0.24],
-      [-0.42, 0.32, 0.7, 0.24],
-      [1.95, 0.08, 0.88, -0.27],
-    ];
+    const ramps = this.jumpZones.map((zone, ordinal) => {
+      const scale = ordinal % 2 === 0 ? 1 : 0.74;
+      return {
+        x: zone.x / COURSE_SCALE,
+        z: zone.z / COURSE_SCALE,
+        heading: zone.meshRotationY,
+        scale,
+        tilt: ordinal % 2 === 0 ? 0.3 : 0.24,
+      };
+    });
     this.jumpMesh = this._addInstances(
       new THREE.BoxGeometry(0.72, 0.055, 0.55),
       red,
-      ramps.map(([x, z, scale, tilt]) => ({
+      ramps.map(({ x, z, heading, scale, tilt }) => ({
         position: new THREE.Vector3(x, 0.12 * scale, z),
-        rotation: new THREE.Euler(0, 0, tilt),
+        rotation: new THREE.Euler(0, heading, tilt, 'YZX'),
         scale: new THREE.Vector3(scale, scale, scale),
       }))
     );
     this._addInstances(
       new THREE.BoxGeometry(0.1, 0.012, 0.56),
       yellow,
-      ramps.map(([x, z, scale, tilt]) => ({
+      ramps.map(({ x, z, heading, scale, tilt }) => ({
         position: new THREE.Vector3(
-          x + Math.cos(tilt) * 0.2 * scale,
+          x + Math.cos(heading) * Math.cos(tilt) * 0.2 * scale,
           0.19 * scale,
-          z
+          z - Math.sin(heading) * Math.cos(tilt) * 0.2 * scale
         ),
-        rotation: new THREE.Euler(0, 0, tilt),
+        rotation: new THREE.Euler(0, heading, tilt, 'YZX'),
         scale: new THREE.Vector3(scale, scale, scale),
       })),
       { castShadow: false }
     );
   }
 
+  // The loop straddles the racing line on the start/finish straight. stepLoop()
+  // carries the car along x at a fixed z, so the torus stays axis-aligned and
+  // only its position tracks the circuit.
   _addLoop(yellow, red) {
+    const centerX = this.loopFeature.centerX / COURSE_SCALE;
+    const centerZ = this.loopFeature.centerZ / COURSE_SCALE;
     const loop = this._addMesh(
       new THREE.TorusGeometry(0.5, 0.055, 14, 64),
       yellow,
-      new THREE.Vector3(0.95, 0.52, 0.08),
+      new THREE.Vector3(centerX, 0.52, centerZ),
       new THREE.Euler(0, 0, 0)
     );
     loop.name = 'stunt-loop';
@@ -2761,18 +2821,18 @@ class Game {
     const base = this._addMesh(
       new THREE.BoxGeometry(0.32, 0.065, 0.7),
       red,
-      new THREE.Vector3(0.95, 0.032, 0.08)
+      new THREE.Vector3(centerX, 0.032, centerZ)
     );
     this._addInstances(
       new THREE.BoxGeometry(0.58, 0.035, 0.08),
       red,
       [
         {
-          position: new THREE.Vector3(0.45, 0.025, 0.08),
+          position: new THREE.Vector3(centerX - 0.5, 0.025, centerZ),
           rotation: new THREE.Euler(0, 0, 0.08),
         },
         {
-          position: new THREE.Vector3(1.45, 0.025, 0.08),
+          position: new THREE.Vector3(centerX + 0.5, 0.025, centerZ),
           rotation: new THREE.Euler(0, 0, -0.08),
         },
       ]
@@ -3059,7 +3119,10 @@ class Game {
 
   _positionDesktopCamera() {
     if (!this.desktopMode) return;
-    if (innerWidth / innerHeight < 0.72) {
+    if (this.overviewCamera) {
+      this.baseCameraFov = 40;
+      this.cameraOffset.set(0, 15.5 * COURSE_SCALE / 2.15, 13.5 * COURSE_SCALE / 2.15);
+    } else if (innerWidth / innerHeight < 0.72) {
       this.baseCameraFov = 54;
       this.cameraOffset.set(8.4, 9.2, 11);
     } else {
@@ -3068,9 +3131,9 @@ class Game {
     }
     this.camera.fov = this.baseCameraFov;
     this.cameraTarget.set(
-      this.localCar?.group.position.x || 0,
+      this.overviewCamera ? 0 : (this.localCar?.group.position.x || 0),
       0.14,
-      this.localCar?.group.position.z || 0
+      this.overviewCamera ? 0 : (this.localCar?.group.position.z || 0)
     );
     this.camera.position.copy(this.cameraTarget).add(this.cameraOffset);
     this.camera.updateProjectionMatrix();
@@ -3149,22 +3212,25 @@ class Game {
     let telemetry = null;
     const preSurface = this._sampleSurface(this.localCar.group.position);
     this._applySteeringAssist(preSurface);
-    const rampZone = JUMP_ZONES.find((zone) => (
+    this._updateDemoAutopilot(preSurface);
+    const rampZone = this.jumpZones.find((zone) => (
       Math.hypot(
         this.localCar.group.position.x - zone.x,
         this.localCar.group.position.z - zone.z
       ) <= zone.radius * 0.45
     ));
+    // Ramps now sit on the circuit, so launching no longer requires the old
+    // infield stunt strip - being on the road (or its shoulder) is enough.
     const rampLaunchSpeed = (
       this.props.jump &&
       this.localCar.spec.category === 'ground' &&
-      preSurface.type === 'stunt' &&
+      preSurface.type !== 'offroad' &&
       rampZone
     )
       ? Core.getRampLaunchSpeed(
           this.localCar.group.position,
           this.localCar.velocity,
-          JUMP_ZONES
+          this.jumpZones
         )
       : 0;
     const loopTrigger = (
@@ -3173,15 +3239,15 @@ class Game {
       !this.localCar.airborne &&
       this.localCar.loopCooldown <= 0 &&
       Math.abs(this.localCar.velocity) > 1.05 &&
-      Math.abs(this.localCar.group.position.x - STUNT_LOOP.centerX) < 0.24 &&
-      Math.abs(this.localCar.group.position.z - STUNT_LOOP.centerZ) < 0.22
+      Math.abs(this.localCar.group.position.x - this.loopFeature.centerX) < 0.32 &&
+      Math.abs(this.localCar.group.position.z - this.loopFeature.centerZ) < 0.3
     );
     this.localCar.networkRaceState = this._serializeRaceState();
     for (const car of this.worldCars.values()) {
       const result = car.update(delta, car === this.localCar
         ? {
             boost: this.boostTimer > 0,
-            loop: this.localCar.loopState || loopTrigger ? STUNT_LOOP : null,
+            loop: this.localCar.loopState || loopTrigger ? this.loopFeature : null,
             loopTrigger,
             rampLaunchSpeed,
             surface: preSurface,
@@ -3228,11 +3294,15 @@ class Game {
     }
 
     if (this.desktopMode) {
-      const cameraGoal = new THREE.Vector3(
-        this.localCar.group.position.x,
-        0.14 + this.localCar.group.position.y * 0.18,
-        this.localCar.group.position.z
-      );
+      // Overview framing holds the whole circuit in shot for showcase captures;
+      // normal play keeps the close chase camera that sells the speed.
+      const cameraGoal = this.overviewCamera
+        ? new THREE.Vector3(0, 0.14, 0)
+        : new THREE.Vector3(
+            this.localCar.group.position.x,
+            0.14 + this.localCar.group.position.y * 0.18,
+            this.localCar.group.position.z
+          );
       const blend = this.reducedMotion ? 1 : 1 - Math.exp(-4.6 * delta);
       this.cameraTarget.lerp(cameraGoal, blend);
       this.camera.position.copy(this.cameraTarget).add(this.cameraOffset);
@@ -3607,6 +3677,7 @@ class Game {
   }
 
   _handleRecovery(telemetry, delta, boundaryCollision) {
+    if (this.recoveryEnabled === false) return false;
     const position = this.localCar.group.position;
     const finitePosition = [position.x, position.y, position.z].every(Number.isFinite);
     if (!finitePosition || boundaryCollision) {
@@ -4317,6 +4388,12 @@ function enterGame(runtime = null) {
     recover() {
       game._recoverVehicle();
     },
+    // Tests that park the car off the course need to observe it there. Auto
+    // recovery would otherwise teleport it back to the last safe road pose
+    // before the measurement window closes.
+    setRecoveryEnabled(enabled) {
+      game.recoveryEnabled = enabled !== false;
+    },
     summonVehicle(type) {
       return game._summonVehicle(type);
     },
@@ -4411,6 +4488,12 @@ function enterGame(runtime = null) {
         geometries: memory.geometries,
         jumpCount: game.jumpMesh ? game.jumpMesh.count : 0,
         loopRotationY: game.stuntLoop ? game.stuntLoop.rotation.y : null,
+        // Ramps and the loop are derived per-circuit, so tests read their real
+        // positions from here instead of hard-coding course coordinates.
+        jumpZones: game.jumpZones
+          ? game.jumpZones.map((zone) => ({ ...zone }))
+          : [],
+        loopFeature: game.loopFeature ? { ...game.loopFeature } : null,
         textures: memory.textures,
         objects,
         particles: game.particles.count,
@@ -4808,7 +4891,13 @@ async function bootstrap() {
     document.documentElement.classList.add('force-touch');
   }
   if (params.get('demo') === 'drive') {
-    window.XRRC_DEMO_INPUT = { throttle: 0.88, steering: 0.34 };
+    // Constant steering used to trace the old oval, but it drives straight off
+    // a circuit with real corners, so the demo now follows the racing line.
+    window.XRRC_DEMO_AUTOPILOT = true;
+    window.XRRC_DEMO_INPUT = { throttle: 0.88, steering: 0 };
+  }
+  if (params.get('view') === 'overview') {
+    window.XRRC_OVERVIEW_CAMERA = true;
   }
   if (params.get('mode') === 'desktop') {
     window.setTimeout(() => document.getElementById('desktop-btn').click(), 80);

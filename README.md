@@ -18,11 +18,13 @@ behind Tailscale Serve.
 ## Highlights
 
 - Responsive lobby and HUD with English, Spanish, and French localization.
-- Six larger spline circuits with distinct scenery, palettes, lighting, and
-  trackside props.
+- Six spline circuits with distinct racing lines, scenery, palettes, lighting,
+  and trackside props - hairpins, sweepers and direction changes rather than
+  six variations on an oval.
 - Seven handling classes plus six on-demand GLB rally-car skins.
-- Asphalt, shoulders, curbs, grid markings, a four-ramp jump park, and an
-  aligned vertical stunt loop.
+- Asphalt, shoulders, curbs, grid markings, four ramps, and a vertical stunt
+  loop - all placed on the racing line itself, so a lap runs through them
+  instead of detouring to a separate stunt strip.
 - Road and off-road traction, registered prop collisions, real airborne arcs,
   landing impacts, ordered checkpoints, wrong-way feedback, and automatic recovery.
 - Configurable one-, three-, or five-lap races with sector timing, live
@@ -115,8 +117,10 @@ only when **Use 8th Wall** is selected.
 4. In AR, place the course on a detected surface. The countdown starts once the
    course is placed.
 
-Jump park, loop, and street-kit props can be enabled independently. The main
-spline circuit remains available in every configuration.
+Ramps, loop, and street-kit props can be enabled independently. Ramp and loop
+positions are derived from each circuit's own spline at load time - the loop
+takes the longest straight and the ramps spread around the lap - so they always
+sit on the racing line whichever course is selected.
 
 ### Race rules, rivals, and records
 
@@ -219,7 +223,7 @@ Relay access still determines who can join a private heat.
 
 Each handling class defines its own acceleration, reverse speed, drag, steering,
 bounce, ride height, and pivot-turn behavior. Sampled course surfaces preserve
-speed and grip on asphalt or the stunt lane, while off-road terrain reduces
+speed and grip on asphalt and its shoulder, while off-road terrain reduces
 acceleration, steering, and maximum speed. The route HUD reports lap, sector,
 course progress, airborne state, and wrong-way or off-course driving.
 
@@ -438,7 +442,8 @@ the public site.
 | `quality` | `quest` | Forces the reduced-cost Quest profile |
 | `controls` | `touch` | Forces the touch UI for testing |
 | `mode` | `desktop` | Starts desktop mode automatically |
-| `demo` | `drive` | Supplies deterministic driving input for captures |
+| `demo` | `drive` | Autopilots the car around the circuit for captures |
+| `view` | `overview` | Frames the whole circuit instead of chasing the car |
 
 Valid vehicle IDs are `rally`, `buggy`, `truck`, `motorcycle`, `tank`, `plane`,
 `helicopter`, `toy-car-1`, `toy-car-2`, `toy-car-3`, `toy-car-taxi`,
@@ -452,10 +457,11 @@ system uses one points geometry and updates typed arrays instead of creating
 per-effect meshes.
 
 The original batching pass reduced the 1440 x 900 procedural rally reference
-from **363 to 74 draw calls** at **16,222 rendered triangles**. The current
-three-rival competition scene measures **85 draw calls**, **82 geometries**, and
-**16,802 triangles**. A five-rival scene with a visible personal-best ghost
-measures **88 draw calls** and **82 geometries**. Rival bodies use a single
+from **363 to 74 draw calls** at **16,222 rendered triangles**. On the enlarged
+circuits a three-rival competition scene measures **69-82 draw calls** and
+**78-80 geometries** across the six courses, rising to about **16,700
+triangles** when the overview camera puts the whole lap in frustum. Rival
+bodies use a single
 low-poly mesh each, skid marks are instanced and attached only while needed, and
 the ghost is non-colliding. Browser tests enforce the render budget for every
 procedural vehicle class. GLB skin complexity depends on the selected asset.

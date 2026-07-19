@@ -101,11 +101,13 @@ async function main() {
         '/?signal=off&mode=desktop&vehicle=rally&demo=drive',
         { race: true }
       );
+      // Circuit showcases use the overview camera so the whole lap is in frame;
+      // the chase camera only holds part of a course at the current scale.
       for (const track of tracks) {
         await capture(
           desktop,
           `track-${track}.png`,
-          `/?signal=off&mode=desktop&track=${track}&vehicle=rally`,
+          `/?signal=off&mode=desktop&track=${track}&vehicle=rally&view=overview`,
           { race: true }
         );
       }
