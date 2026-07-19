@@ -8,7 +8,22 @@ const { chromium, devices } = require('@playwright/test');
 const port = 4174;
 const baseUrl = `http://127.0.0.1:${port}`;
 const outputDir = path.join(__dirname, '..', 'docs', 'screenshots');
-const vehicles = ['rally', 'buggy', 'truck', 'motorcycle', 'tank', 'plane', 'helicopter'];
+const tracks = ['backyard', 'alpine', 'desert', 'harbor', 'sakura', 'lunar'];
+const vehicles = [
+  'rally',
+  'buggy',
+  'truck',
+  'motorcycle',
+  'tank',
+  'plane',
+  'helicopter',
+  'toy-car-1',
+  'toy-car-2',
+  'toy-car-3',
+  'toy-car-taxi',
+  'toy-car-cop',
+  'car1',
+];
 
 async function waitForServer() {
   for (let attempt = 0; attempt < 40; attempt += 1) {
@@ -27,6 +42,9 @@ async function settle(page, race = false) {
   await page.evaluate(() => document.fonts.ready);
   if (race) {
     await page.waitForFunction(() => window.XRRC_DIAGNOSTICS?.snapshot().calls > 0);
+    await page.waitForFunction(() => (
+      window.XRRC_DIAGNOSTICS?.snapshot().localVehicleRender.modelStatus === 'ready'
+    ));
     await page.waitForFunction(() => document.getElementById('countdown')?.textContent.trim());
     await page.waitForFunction(() => !document.getElementById('countdown')?.textContent.trim());
     await page.waitForTimeout(500);
@@ -42,6 +60,10 @@ async function capture(context, name, url, options = {}) {
     await page.locator('#signal-panel summary').click();
   }
   await settle(page, options.race);
+  if (options.scrollTo) {
+    await page.locator(options.scrollTo).scrollIntoViewIfNeeded();
+    await page.waitForTimeout(100);
+  }
   await page.screenshot({
     animations: 'disabled',
     fullPage: Boolean(options.fullPage),
@@ -79,6 +101,14 @@ async function main() {
         '/?signal=off&mode=desktop&vehicle=rally&demo=drive',
         { race: true }
       );
+      for (const track of tracks) {
+        await capture(
+          desktop,
+          `track-${track}.png`,
+          `/?signal=off&mode=desktop&track=${track}&vehicle=rally`,
+          { race: true }
+        );
+      }
       for (const vehicle of vehicles) {
         await capture(
           desktop,
@@ -122,7 +152,9 @@ async function main() {
         deviceScaleFactor: 1,
       });
       await capture(mobile, 'lobby-mobile.png', '/?signal=off');
-      await capture(mobile, 'lobby-mobile-full.png', '/?signal=off', { fullPage: true });
+      await capture(mobile, 'lobby-mobile-setup.png', '/?signal=off&vehicle=motorcycle', {
+        scrollTo: '#desktop-btn',
+      });
       await capture(
         mobile,
         'race-mobile.png',

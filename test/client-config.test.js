@@ -62,9 +62,10 @@ test('adds normalized rooms and derives the backend health endpoint', () => {
     Config.buildSignalUrl(
       'https://rally-box.example-tailnet.ts.net',
       'Friday Night',
-      'https:'
+      'https:',
+      'alpine'
     ),
-    'wss://rally-box.example-tailnet.ts.net/ws?room=friday-night'
+    'wss://rally-box.example-tailnet.ts.net/ws?room=friday-night&track=alpine'
   );
   assert.equal(
     Config.getHealthUrl(
@@ -79,13 +80,15 @@ test('builds a repository-subpath invite without dropping the relay', () => {
   const shareUrl = new URL(Config.buildShareUrl(
     'https://lab.liambroza.com/XRRC/?debug=1#track',
     'Pit Crew',
-    'https://rally-box.example-tailnet.ts.net'
+    'https://rally-box.example-tailnet.ts.net',
+    'sakura'
   ));
 
   assert.equal(shareUrl.origin, 'https://lab.liambroza.com');
   assert.equal(shareUrl.pathname, '/XRRC/');
   assert.equal(shareUrl.searchParams.get('debug'), '1');
   assert.equal(shareUrl.searchParams.get('room'), 'pit-crew');
+  assert.equal(shareUrl.searchParams.get('track'), 'sakura');
   assert.equal(
     shareUrl.searchParams.get('signal'),
     'wss://rally-box.example-tailnet.ts.net/ws'

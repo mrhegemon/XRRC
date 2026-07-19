@@ -9,10 +9,50 @@ const XRCore = window.XRRCXRCore;
 const ControlsCore = window.XRRCControlsCore;
 const I18n = window.XRRCI18n;
 const ShareCore = window.XRRCShareCore;
-const TRACK_BOUNDS = Object.freeze({ x: 4.15, z: 3.15 });
-const START_GRID = Object.freeze({ x: 0.8, z: 2.25, heading: Math.PI / 2 });
-const RAMP_ZONE = Object.freeze({ x: -1.45, z: 0.08 });
-const ROAD_WIDTH = 1.18;
+const TrackCore = window.XRRCTrackCore;
+const RaceCore = window.XRRCRaceCore;
+const COURSE_SCALE = 1.42;
+const XR_WORLD_SCALE = 0.4;
+const MAX_FRAME_CATCHUP = 0.25;
+const MAX_SIMULATION_STEP = 0.05;
+const TRACK_BOUNDS = Object.freeze({
+  x: 4.15 * COURSE_SCALE,
+  z: 3.15 * COURSE_SCALE,
+});
+const BASE_START_GRID = Object.freeze({ x: 0.8, z: 2.25, heading: Math.PI / 2 });
+const START_GRID = Object.freeze({
+  x: BASE_START_GRID.x * COURSE_SCALE,
+  z: BASE_START_GRID.z * COURSE_SCALE,
+  heading: BASE_START_GRID.heading,
+});
+const JUMP_ZONES = Object.freeze([
+  [-1.55, 0.08, 0.46, 0.5],
+  [-0.42, -0.16, 0.34, 0.32],
+  [-0.42, 0.32, 0.34, 0.32],
+  [1.95, 0.08, 0.42, 0.56],
+].map(([x, z, radius, lift]) => Object.freeze({
+  x: x * COURSE_SCALE,
+  z: z * COURSE_SCALE,
+  radius: radius * COURSE_SCALE,
+  lift,
+})));
+const STUNT_LANE = Object.freeze({
+  x: 0,
+  z: 0.08 * COURSE_SCALE,
+  halfLength: 2.275 * COURSE_SCALE,
+  halfWidth: 0.36 * COURSE_SCALE,
+  rotation: 0.035,
+});
+const STUNT_LOOP = Object.freeze({
+  centerX: 0.95 * COURSE_SCALE,
+  centerZ: 0.08 * COURSE_SCALE,
+  radius: 0.5 * COURSE_SCALE,
+});
+const COURSE_SAMPLE_COUNT = 240;
+const RACE_CHECKPOINTS = Object.freeze([0.22, 0.47, 0.72]);
+const RACE_SAVE_KEY = 'xrrc-race-records-v1';
+const AI_NAMES = Object.freeze(['BOLT', 'MICA', 'PIXEL', 'NOVA', 'KICK']);
+const AI_COLORS = Object.freeze([0x457b9d, 0x2a9d8f, 0xe9c46a, 0xf4a261, 0xa8dadc]);
 const QR_CODE_SOURCE = 'https://cdn.jsdelivr.net/npm/qrcode@1.5.4/+esm';
 const remoteCars = new Map();
 
@@ -36,12 +76,14 @@ const glbModelCache = new Map(); // file -> Promise<THREE.Object3D>
 
 function loadGLBModel(file) {
   if (!glbModelCache.has(file)) {
-    glbModelCache.set(
-      file,
-      new Promise((resolve, reject) => {
+    const request = new Promise((resolve, reject) => {
         gltfLoader.load(file, (gltf) => resolve(gltf.scene), undefined, reject);
       })
-    );
+      .catch((error) => {
+        glbModelCache.delete(file);
+        throw error;
+      });
+    glbModelCache.set(file, request);
   }
   return glbModelCache.get(file);
 }
@@ -65,7 +107,7 @@ function pitStallPosition(type) {
   const cols = VEHICLE_TYPES.length;
   return {
     x: START_GRID.x + (index - (cols - 1) / 2) * 0.36,
-    z: START_GRID.z + 0.55,
+    z: START_GRID.z + 0.9,
     heading: START_GRID.heading,
   };
 }
@@ -77,17 +119,33 @@ function pitStallPosition(type) {
 // Measured with the group's transform temporarily zeroed so a vehicle's
 // current heading/position never skews the result.
 function measureHalfExtents(group) {
-  const heading = group.rotation.y;
-  const position = group.position.clone();
-  group.rotation.y = 0;
-  group.position.set(0, 0, 0);
   group.updateWorldMatrix(true, true);
-  const box = new THREE.Box3().setFromObject(group);
-  group.rotation.y = heading;
-  group.position.copy(position);
-  group.updateWorldMatrix(true, true);
+  const box = new THREE.Box3().makeEmpty();
+  const inverseRoot = group.matrixWorld.clone().invert();
+  const corner = new THREE.Vector3();
+  group.traverse((object) => {
+    if (!object.isMesh || !object.geometry) return;
+    if (!object.geometry.boundingBox) object.geometry.computeBoundingBox();
+    const bounds = object.geometry.boundingBox;
+    if (!bounds) return;
+    const localMatrix = inverseRoot.clone().multiply(object.matrixWorld);
+    for (const x of [bounds.min.x, bounds.max.x]) {
+      for (const y of [bounds.min.y, bounds.max.y]) {
+        for (const z of [bounds.min.z, bounds.max.z]) {
+          corner.set(x, y, z).applyMatrix4(localMatrix);
+          box.expandByPoint(corner);
+        }
+      }
+    }
+  });
+  if (box.isEmpty()) box.setFromCenterAndSize(new THREE.Vector3(), new THREE.Vector3(0.1, 0.1, 0.1));
   const size = box.getSize(new THREE.Vector3());
-  return { x: Math.max(size.x / 2, 0.05), z: Math.max(size.z / 2, 0.05) };
+  return {
+    x: Math.max(size.x / 2, 0.05),
+    z: Math.max(size.z / 2, 0.05),
+    minY: box.min.y,
+    maxY: box.max.y,
+  };
 }
 
 function clampToBounds(position, bounds = TRACK_BOUNDS) {
@@ -95,12 +153,38 @@ function clampToBounds(position, bounds = TRACK_BOUNDS) {
   position.z = Core.clamp(position.z, -bounds.z, bounds.z);
 }
 
+function loadRaceSave() {
+  try {
+    return RaceCore.parseSave(window.localStorage.getItem(RACE_SAVE_KEY));
+  } catch (error) {
+    console.warn('[race] Personal records are unavailable:', error);
+    return RaceCore.emptySave();
+  }
+}
+
+function persistRaceSave(save) {
+  try {
+    window.localStorage.setItem(RACE_SAVE_KEY, JSON.stringify(save));
+    return true;
+  } catch (error) {
+    console.warn('[race] Personal records could not be saved:', error);
+    return false;
+  }
+}
+
+function wrappedAngleDelta(target, current) {
+  let delta = target - current;
+  while (delta > Math.PI) delta -= Math.PI * 2;
+  while (delta < -Math.PI) delta += Math.PI * 2;
+  return delta;
+}
+
 function vehicleOBB(car) {
   const p = car.group.position;
   return {
     x: p.x,
     z: p.z,
-    theta: car.group.rotation.y,
+    theta: -car.group.rotation.y,
     hx: car.halfExtents.x,
     hz: car.halfExtents.z,
   };
@@ -161,6 +245,7 @@ let networkManager = null;
 let toastTimer = null;
 let shareCopyTimer = null;
 let shareQrRequest = 0;
+let eighthWallConfigured = false;
 let qrCodeModulePromise = null;
 let webXRSupportChecked = false;
 let webXRSupported = false;
@@ -286,6 +371,189 @@ class ParticleField {
   }
 }
 
+function createNameplate(text, color) {
+  const canvas = document.createElement('canvas');
+  canvas.width = 192;
+  canvas.height = 48;
+  const context = canvas.getContext('2d');
+  context.fillStyle = '#24251f';
+  context.fillRect(0, 4, canvas.width, 40);
+  context.fillStyle = color;
+  context.fillRect(0, 4, 10, 40);
+  context.fillStyle = '#f4ead2';
+  context.font = '900 25px sans-serif';
+  context.textAlign = 'center';
+  context.textBaseline = 'middle';
+  context.fillText(text, 102, 25);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
+    depthTest: false,
+    map: texture,
+    transparent: true,
+  }));
+  sprite.position.y = 0.36;
+  sprite.scale.set(0.58, 0.145, 1);
+  sprite.renderOrder = 8;
+  return sprite;
+}
+
+const raceAvatarGeometry = (() => {
+  const parts = [
+    [0.25, 0.075, 0.42, 0, 0.065, 0, [1, 1, 1]],
+    [0.19, 0.075, 0.2, 0, 0.135, -0.035, [0.32, 0.34, 0.31]],
+    [0.28, 0.035, 0.055, 0, 0.055, -0.2, [0.15, 0.16, 0.14]],
+    [0.052, 0.07, 0.105, -0.135, 0.045, -0.13, [0.07, 0.075, 0.065]],
+    [0.052, 0.07, 0.105, 0.135, 0.045, -0.13, [0.07, 0.075, 0.065]],
+    [0.052, 0.07, 0.105, -0.135, 0.045, 0.13, [0.07, 0.075, 0.065]],
+    [0.052, 0.07, 0.105, 0.135, 0.045, 0.13, [0.07, 0.075, 0.065]],
+  ];
+  const positions = [];
+  const normals = [];
+  const colors = [];
+  for (const [width, height, depth, x, y, z, color] of parts) {
+    const part = new THREE.BoxGeometry(width, height, depth)
+      .translate(x, y, z)
+      .toNonIndexed();
+    positions.push(...part.getAttribute('position').array);
+    normals.push(...part.getAttribute('normal').array);
+    const vertexCount = part.getAttribute('position').count;
+    for (let index = 0; index < vertexCount; index += 1) colors.push(...color);
+    part.dispose();
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geometry.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+  geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+  geometry.computeBoundingSphere();
+  return geometry;
+})();
+
+class RaceAvatar {
+  constructor(name, color, ghost = false) {
+    this.group = new THREE.Group();
+    this.velocity = 0;
+    this.knockback = { x: 0, z: 0 };
+    this.offset = { x: 0, z: 0 };
+    this.halfExtents = { x: 0.12, z: 0.21, minY: -0.06, maxY: 0.08 };
+    const material = new THREE.MeshStandardMaterial({
+      color,
+      emissive: ghost ? color : 0x000000,
+      emissiveIntensity: ghost ? 0.28 : 0,
+      metalness: ghost ? 0.05 : 0.22,
+      opacity: ghost ? 0.32 : 1,
+      roughness: 0.42,
+      transparent: ghost,
+      depthWrite: !ghost,
+      vertexColors: true,
+    });
+    this.body = new THREE.Mesh(raceAvatarGeometry, material);
+    this.body.castShadow = !ghost;
+    this.body.receiveShadow = !ghost;
+    this.group.add(this.body);
+    if (name) {
+      this.nameplate = createNameplate(name, `#${new THREE.Color(color).getHexString()}`);
+      this.group.add(this.nameplate);
+    }
+  }
+
+  setPose(position, heading) {
+    this.offset.x *= 0.985;
+    this.offset.z *= 0.985;
+    this.group.position.set(
+      position.x + this.offset.x,
+      position.y,
+      position.z + this.offset.z
+    );
+    this.group.rotation.y = heading;
+  }
+
+  applyKnockback(delta) {
+    this.offset.x += this.knockback.x * delta;
+    this.offset.z += this.knockback.z * delta;
+    const damping = Math.max(0, 1 - 6 * delta);
+    this.knockback.x *= damping;
+    this.knockback.z *= damping;
+  }
+
+  dispose() {
+    this.body.material.dispose();
+    if (this.nameplate) {
+      this.nameplate.material.map.dispose();
+      this.nameplate.material.dispose();
+    }
+    if (this.group.parent) this.group.parent.remove(this.group);
+  }
+}
+
+class SkidMarkField {
+  constructor(parent, count = 48) {
+    this.parent = parent;
+    this.attached = false;
+    this.cursor = 0;
+    this.marks = Array.from({ length: count }, () => ({
+      age: Infinity,
+      position: new THREE.Vector3(0, -100, 0),
+      rotation: new THREE.Quaternion(),
+    }));
+    this.mesh = new THREE.InstancedMesh(
+      new THREE.PlaneGeometry(0.038, 0.2).rotateX(-Math.PI / 2),
+      new THREE.MeshBasicMaterial({
+        color: 0x24251f,
+        depthWrite: false,
+        opacity: 0.34,
+        transparent: true,
+      }),
+      count
+    );
+    this.mesh.frustumCulled = false;
+    this._matrix = new THREE.Matrix4();
+    this._scale = new THREE.Vector3();
+    this.update(0);
+  }
+
+  add(car) {
+    if (!this.attached) {
+      this.parent.add(this.mesh);
+      this.attached = true;
+    }
+    for (const side of [-1, 1]) {
+      const mark = this.marks[this.cursor];
+      mark.age = 0;
+      mark.position.copy(car.pointFromLocal(side * 0.075, 0.006, 0.17));
+      mark.rotation.setFromAxisAngle(new THREE.Vector3(0, 1, 0), car.group.rotation.y);
+      this.cursor = (this.cursor + 1) % this.marks.length;
+    }
+  }
+
+  update(delta) {
+    this.marks.forEach((mark, index) => {
+      mark.age += delta;
+      const life = Math.max(0, 1 - mark.age / 4.2);
+      this._scale.set(life > 0 ? 0.75 + life * 0.25 : 0, 1, life > 0 ? 1 : 0);
+      this._matrix.compose(mark.position, mark.rotation, this._scale);
+      this.mesh.setMatrixAt(index, this._matrix);
+    });
+    this.mesh.instanceMatrix.needsUpdate = true;
+  }
+
+  clear() {
+    this.marks.forEach((mark) => {
+      mark.age = Infinity;
+      mark.position.y = -100;
+    });
+    this.update(0);
+    if (this.attached) this.parent.remove(this.mesh);
+    this.attached = false;
+  }
+
+  dispose() {
+    this.mesh.geometry.dispose();
+    this.mesh.material.dispose();
+    if (this.mesh.parent) this.mesh.parent.remove(this.mesh);
+  }
+}
+
 class Vehicle {
   constructor(color, isLocal, type = 'rally') {
     this.group = new THREE.Group();
@@ -294,21 +562,34 @@ class Vehicle {
     this.color = color;
     this.isLocal = isLocal;
     this.velocity = 0;
+    this.verticalVelocity = 0;
     this.throttle = 0;
     this.steering = 0;
+    this.lift = 0;
     this.broadcastTimer = 0;
     this.sequence = 0;
     this.active = !isLocal;
     this.wheels = [];
     this.frontWheelPivots = [];
     this.rotors = [];
-    this.jumpLift = 0;
+    this.airborne = false;
+    this.rampContact = false;
+    this.loopState = null;
+    this.loopPitch = 0;
+    this.loopCooldown = 0;
+    this.surface = 'road';
     this.hoverTime = Math.random() * Math.PI * 2;
     this.lastRemoteSequence = -1;
     this.remoteTarget = null;
     this.remoteReceivedAt = 0;
+    this.networkRaceState = null;
+    this.raceState = null;
+    this.lastRaceVersion = null;
     this._bodyTilt = 0;
     this.knockback = { x: 0, z: 0 };
+    this.disposed = false;
+    this.modelSource = 'procedural';
+    this.modelStatus = 'building';
     this.modelReady = Promise.resolve();
     this.setType(type);
     this.reset(
@@ -318,10 +599,12 @@ class Vehicle {
     );
 
     if (isLocal) {
-      document.addEventListener('car-input', (event) => {
+      this._inputHandler = (event) => {
+        this.lift = event.detail.lift || 0;
         this.throttle = event.detail.throttle;
         this.steering = event.detail.steering;
-      });
+      };
+      document.addEventListener('car-input', this._inputHandler);
     }
   }
 
@@ -404,15 +687,19 @@ class Vehicle {
   }
 
   _clearVisual() {
+    const geometries = new Set();
+    const materials = new Set();
     this.visual.traverse((object) => {
-      if (object.geometry) object.geometry.dispose();
+      if (object.geometry) geometries.add(object.geometry);
       if (object.material) {
-        const materials = Array.isArray(object.material)
+        const objectMaterials = Array.isArray(object.material)
           ? object.material
           : [object.material];
-        for (const material of materials) material.dispose();
+        for (const material of objectMaterials) materials.add(material);
       }
     });
+    for (const geometry of geometries) geometry.dispose();
+    for (const material of materials) material.dispose();
     this.visual.clear();
     this.wheels = [];
     this.frontWheelPivots = [];
@@ -429,11 +716,14 @@ class Vehicle {
     this.group.position.y = this.spec.rideHeight;
 
     const skin = GLB_SKINS[nextType];
+    this.visual.scale.setScalar(skin ? 1 : this.spec.visualScale || 1);
     if (skin) {
       // Procedural placeholder so the car is visible immediately; swapped
       // for the real model once the glb finishes loading.
       this._buildRally();
       this.halfExtents = measureHalfExtents(this.group);
+      this.modelSource = 'procedural-fallback';
+      this.modelStatus = 'loading';
       this.modelReady = this._loadGLBSkin(nextType, skin);
       return;
     }
@@ -449,17 +739,23 @@ class Vehicle {
     };
     builders[nextType]();
     this.halfExtents = measureHalfExtents(this.group);
+    this.modelSource = 'procedural';
+    this.modelStatus = 'ready';
     this.modelReady = Promise.resolve();
   }
 
   async _loadGLBSkin(type, skin) {
     try {
       const source = await loadGLBModel(skin.file);
-      if (this.type !== type) return; // superseded by another setType() call
+      if (this.disposed || this.type !== type) return;
 
       const model = source.clone(true);
       model.traverse((node) => {
         if (!node.isMesh) return;
+        node.geometry = node.geometry.clone();
+        node.material = Array.isArray(node.material)
+          ? node.material.map((material) => material.clone())
+          : node.material.clone();
         node.castShadow = true;
         node.receiveShadow = true;
         if (/wheel/i.test(node.name)) this.wheels.push(node);
@@ -479,7 +775,11 @@ class Vehicle {
       this._clearVisual();
       this.visual.add(pivot);
       this.halfExtents = measureHalfExtents(this.group);
+      this.modelSource = 'glb';
+      this.modelStatus = 'ready';
     } catch (err) {
+      if (this.disposed || this.type !== type) return;
+      this.modelStatus = 'fallback';
       console.error(`[vehicle] failed to load ${skin.file}, keeping fallback body`, err);
     }
   }
@@ -722,13 +1022,30 @@ class Vehicle {
     this._antenna(dark, yellow, 0.08, 0.04, 0.2);
   }
 
-  reset(x = START_GRID.x, z = START_GRID.z, heading = START_GRID.heading) {
-    this.group.position.set(x, this.spec.rideHeight, z);
+  reset(
+    x = START_GRID.x,
+    z = START_GRID.z,
+    heading = START_GRID.heading,
+    y = this.spec.rideHeight
+  ) {
+    this.group.position.set(x, y, z);
+    this.peakY = y;
     this.group.rotation.set(0, heading, 0);
     this.visual.position.y = 0;
     this.visual.rotation.set(0, 0, 0);
     this.velocity = 0;
-    this.jumpLift = 0;
+    this.verticalVelocity = 0;
+    this.throttle = 0;
+    this.steering = 0;
+    this.lift = 0;
+    this.airborne = y > (this.spec.groundHeight ?? this.spec.rideHeight) + 0.01;
+    this.rampContact = false;
+    this.loopState = null;
+    this.loopPitch = 0;
+    this.loopCooldown = 0;
+    this.surface = 'road';
+    this.knockback.x = 0;
+    this.knockback.z = 0;
     this.remoteTarget = null;
   }
 
@@ -752,36 +1069,112 @@ class Vehicle {
   setActive(active) {
     this.active = active;
     if (!active) {
+      this.lift = 0;
       this.throttle = 0;
       this.steering = 0;
     }
   }
 
-  update(delta) {
+  update(delta, context = {}) {
     if (!this.isLocal) {
       return this._updateRemote(delta);
     }
 
     const input = this.active
-      ? { throttle: this.throttle, steering: this.steering }
-      : { throttle: 0, steering: 0 };
+      ? { lift: this.lift, throttle: this.throttle, steering: this.steering }
+      : { lift: 0, throttle: 0, steering: 0 };
+    this.loopCooldown = Math.max(0, this.loopCooldown - delta);
+    const drivingSurface = this.spec.category === 'air' && this.airborne
+      ? 'road'
+      : context.surface?.type;
+    this.drivingSurface = drivingSurface || 'road';
+    const physics = Core.getDrivingPhysics(this.spec.physics, {
+      airborne: this.spec.category === 'ground' && this.airborne,
+      surface: drivingSurface,
+    });
+    if (context.boost) {
+      physics.acceleration *= 1.4;
+      physics.maxForwardSpeed *= 1.26;
+      physics.poweredDrag *= 0.55;
+    }
     const next = Core.stepCar({
       x: this.group.position.x,
       z: this.group.position.z,
       heading: this.group.rotation.y,
       velocity: this.velocity,
     }, input, delta, {
-      ...this.spec.physics,
-      bounds: TRACK_BOUNDS,
+      ...physics,
+      bounds: {
+        x: TRACK_BOUNDS.x - this.halfExtents.x,
+        z: TRACK_BOUNDS.z - this.halfExtents.z,
+      },
     });
+    const isOnRamp = Boolean(context.rampLaunchSpeed);
+    const launchSpeed = isOnRamp && !this.rampContact
+      ? context.rampLaunchSpeed
+      : 0;
+    this.rampContact = isOnRamp;
+    const flight = this.spec.flight;
+    const vertical = Core.stepVertical({
+      y: this.group.position.y,
+      velocityY: this.verticalVelocity,
+    }, input, delta, flight
+      ? {
+          ...flight,
+          forwardSpeed: next.velocity,
+          groundY: this.spec.groundHeight,
+        }
+      : {
+          gravity: 7.2,
+          groundY: this.spec.rideHeight,
+          launchSpeed,
+          mode: 'ground',
+        });
+    if (!this.loopState && context.loopTrigger) {
+      const direction = Math.sign(
+        -Math.sin(this.group.rotation.y) * (Math.sign(this.velocity) || 1)
+      ) || 1;
+      this.loopState = {
+        direction,
+        progress: 0,
+        speed: Math.max(1.15, Math.abs(this.velocity)),
+      };
+    }
+    let loop = null;
+    if (this.loopState && context.loop) {
+      loop = Core.stepLoop(this.loopState, delta, {
+        ...context.loop,
+        direction: this.loopState.direction,
+        groundY: this.spec.rideHeight,
+        speed: this.loopState.speed,
+      });
+      this.loopState.progress = loop.progress;
+      next.x = loop.x;
+      next.z = loop.z;
+      vertical.y = loop.y;
+      vertical.velocityY = loop.velocityY;
+      vertical.airborne = loop.airborne;
+      vertical.grounded = loop.complete;
+      this.loopPitch = loop.pitch;
+      if (loop.complete) {
+        next.x += this.loopState.direction * Math.abs(next.velocity) * delta;
+        this.loopState = null;
+        this.loopCooldown = 0.8;
+      }
+    }
 
     this.velocity = next.velocity;
+    this.verticalVelocity = vertical.velocityY;
+    this.airborne = vertical.airborne;
+    this.surface = context.surface?.type || 'offroad';
     this.group.position.x = next.x;
+    this.group.position.y = vertical.y;
     this.group.position.z = next.z;
+    this.peakY = Math.max(this.peakY, vertical.y);
     this.group.rotation.y = next.heading;
     this.applyKnockback(delta);
     clampToBounds(this.group.position);
-    this._applyVisualMotion(delta, next.speedRatio);
+    this._applyVisualMotion(delta, next.speedRatio, vertical);
     for (const pivot of this.frontWheelPivots) {
       pivot.rotation.y += ((this.steering * 0.42) - pivot.rotation.y) * 0.2;
     }
@@ -797,20 +1190,27 @@ class Vehicle {
         z: this.group.position.z,
         ry: this.group.rotation.y,
         v: this.velocity,
+        vy: this.verticalVelocity,
+        lift: this.lift,
         throttle: this.throttle,
         steering: this.steering,
+        race: this.networkRaceState,
       });
       this.sequence += 1;
     }
 
     return {
       ...next,
+      ...vertical,
+      lift: this.lift,
+      looping: Boolean(this.loopState),
+      surface: this.surface,
       throttle: this.throttle,
       steering: this.steering,
     };
   }
 
-  _applyVisualMotion(delta, speedRatio) {
+  _applyVisualMotion(delta, speedRatio, vertical = null) {
     this.hoverTime += delta;
     const tiltScale = this.type === 'motorcycle'
       ? 0.27
@@ -819,12 +1219,19 @@ class Vehicle {
         : 0.1;
     this._bodyTilt += ((-this.steering * speedRatio * tiltScale) - this._bodyTilt) * 0.13;
     this.visual.rotation.z = this._bodyTilt;
+    const targetPitch = this.loopState
+      ? this.loopPitch
+      : this.spec.category === 'air'
+      ? Core.clamp((-this.lift * 0.16) + (this.verticalVelocity * 0.055), -0.24, 0.24)
+      : vertical?.landed
+        ? -0.08
+        : 0;
+    if (this.loopState) this.visual.rotation.x = targetPitch;
+    else this.visual.rotation.x += (targetPitch - this.visual.rotation.x) * 0.14;
     const hover = this.spec.category === 'air'
       ? Math.sin(this.hoverTime * (this.type === 'helicopter' ? 4.2 : 2.4)) * 0.012
       : 0;
-    const targetLift = hover + this.jumpLift;
-    this.visual.position.y += (targetLift - this.visual.position.y) * 0.2;
-    this.jumpLift *= Math.exp(-5 * delta);
+    this.visual.position.y += (hover - this.visual.position.y) * 0.2;
 
     for (const wheel of this.wheels) {
       wheel.rotation.x += this.velocity * delta * 22;
@@ -848,10 +1255,42 @@ class Vehicle {
     this.remoteTarget = {
       ...state,
       type: this.type,
+      lift: Number.isFinite(state.lift) ? state.lift : 0,
       throttle: Number.isFinite(state.throttle) ? state.throttle : 0,
       steering: Number.isFinite(state.steering) ? state.steering : 0,
     };
+    if (state.race && typeof state.race === 'object') this.applyRaceState(state.race);
     this.remoteReceivedAt = performance.now();
+    return true;
+  }
+
+  applyRaceState(race) {
+    if (
+      !race ||
+      !Number.isFinite(race.completedLaps) ||
+      !Number.isFinite(race.progress)
+    ) {
+      return false;
+    }
+    if (!RaceCore.shouldAcceptRaceState(this.lastRaceVersion, race)) return false;
+    const attempt = Number.isFinite(race.attempt) ? Math.max(0, Math.floor(race.attempt)) : 0;
+    const revision = Number.isFinite(race.revision) ? Math.max(0, Math.floor(race.revision)) : 0;
+    this.lastRaceVersion = { attempt, revision };
+    this.raceState = {
+      attempt,
+      completedLaps: Core.clamp(Math.floor(race.completedLaps), 0, 9),
+      elapsedMs: Number.isFinite(race.elapsedMs) ? Math.max(0, race.elapsedMs) : 0,
+      finishTime: Number.isFinite(race.finishTime) ? race.finishTime : null,
+      finished: Boolean(race.finished),
+      lap: Core.clamp(Math.floor(race.lap || 1), 1, 9),
+      lapTimes: Array.isArray(race.lapTimes)
+        ? race.lapTimes.filter((time) => Number.isFinite(time) && time > 0).slice(0, 9)
+        : [],
+      nextCheckpoint: Core.clamp(Math.floor(race.nextCheckpoint || 0), 0, 3),
+      progress: Core.clamp(race.progress, 0, 0.999999),
+      revision,
+      totalLaps: Core.clamp(Math.floor(race.totalLaps || 3), 1, 9),
+    };
     return true;
   }
 
@@ -875,16 +1314,53 @@ class Vehicle {
     this.applyKnockback(delta);
     clampToBounds(this.group.position);
     this.velocity += (target.v - this.velocity) * blend;
+    this.verticalVelocity += ((target.vy || 0) - this.verticalVelocity) * blend;
+    this.airborne = this.group.position.y > (this.spec.groundHeight ?? this.spec.rideHeight) + 0.01;
+    this.lift = target.lift || 0;
     this.throttle = target.throttle;
     this.steering = target.steering;
     this._applyVisualMotion(
       delta,
-      Math.min(1, Math.abs(this.velocity) / (this.spec.physics.maxForwardSpeed || 1.7))
+      Math.min(1, Math.abs(this.velocity) / (this.spec.physics.maxForwardSpeed || 1.7)),
+      { airborne: this.airborne, landed: false }
     );
     return null;
   }
 
+  getRenderDiagnostics() {
+    let meshes = 0;
+    let triangles = 0;
+    this.visual.traverse((object) => {
+      if (!object.isMesh || !object.geometry) return;
+      meshes += 1;
+      const geometry = object.geometry;
+      const count = geometry.index
+        ? geometry.index.count
+        : geometry.getAttribute('position')?.count || 0;
+      triangles += count / 3;
+    });
+    return {
+      bounds: { ...this.halfExtents },
+      airborne: this.airborne,
+      category: this.spec.category,
+      drivingSurface: this.drivingSurface || 'road',
+      meshes,
+      modelSource: this.modelSource,
+      modelStatus: this.modelStatus,
+      rotors: this.rotors.length,
+      triangles,
+      wheels: this.wheels.length,
+      verticalVelocity: this.verticalVelocity,
+      looping: Boolean(this.loopState),
+    };
+  }
+
   dispose() {
+    this.disposed = true;
+    if (this._inputHandler) {
+      document.removeEventListener('car-input', this._inputHandler);
+      this._inputHandler = null;
+    }
     this._clearVisual();
     if (this.group.parent) this.group.parent.remove(this.group);
   }
@@ -973,6 +1449,7 @@ class Game {
   constructor(canvas, props, runtime = null) {
     this.canvas = canvas;
     this.props = props;
+    this.track = TrackCore.getTrack(props.track);
     this.runtime = runtime;
     this.clock = new THREE.Clock();
     this.isQuest = prefersQuestQuality();
@@ -989,9 +1466,28 @@ class Game {
           powerPreference: 'high-performance',
         });
     this.ownsRenderer = !runtime;
+    this.destroyed = false;
+    this.hitTestSource = null;
+    this.xrSession = null;
     this.desktopMode = false;
     this.isPlaced = false;
     this.countdownStarted = false;
+    this.paused = false;
+    this.totalLaps = RaceCore.normalizeLapCount(props.laps);
+    this.assistEnabled = props.assist !== false;
+    this.raceSave = loadRaceSave();
+    this.aiRacers = [];
+    this.ghostAvatar = null;
+    this.ghostData = null;
+    this.ghostSamples = [];
+    this.ghostSampleTimer = 0;
+    this.boostCharge = 0;
+    this.boostTimer = 0;
+    this.wasDrifting = false;
+    this.skidTimer = 0;
+    this.boostFxTimer = 0;
+    this.standingsTimer = 0;
+    this.baseCameraFov = 44;
     this.collisionCooldown = 0;
     this.dustTimer = 0;
     this.smokeTimer = 0;
@@ -999,6 +1495,13 @@ class Game {
     this.thumbnailGeneration = 0;
     this.thumbnailTask = null;
     this.cameraTarget = new THREE.Vector3();
+    this.cameraOffset = new THREE.Vector3();
+    this.staticColliders = [];
+    this.trackSamples = [];
+    this.lastSafePose = { ...START_GRID, y: Core.getVehicleSpec(props.vehicle).rideHeight };
+    this.stuckTimer = 0;
+    this.lastStaticCollision = null;
+    this.raceState = {};
     this.reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
     if (this.ownsRenderer) {
@@ -1014,36 +1517,372 @@ class Game {
 
     this.gameRoot = new THREE.Group();
     this.gameRoot.visible = false;
-    if (runtime) this.gameRoot.scale.setScalar(0.48);
+    if (runtime) this.gameRoot.scale.setScalar(XR_WORLD_SCALE);
     this.scene.add(this.gameRoot);
+    this.courseRoot = new THREE.Group();
+    this.courseRoot.scale.setScalar(COURSE_SCALE);
+    this.gameRoot.add(this.courseRoot);
     this._buildTrack();
     this.worldCars = new Map(); // vehicle type/skin -> Vehicle placed on the track
     this.particles = new ParticleField(this.gameRoot, this.isQuest ? 96 : 180);
+    this.skidMarks = new SkidMarkField(this.gameRoot, this.isQuest ? 28 : 48);
     this.localCar = this._summonVehicle(props.vehicle, { silent: true });
+    this._initAIRacers(props.multiplayer ? 0 : props.aiCount);
+    this._loadGhost();
+    this._resetRaceState();
     this.reticle = this._createReticle();
     this.scene.add(this.reticle);
     this._addLights();
     this._initVehicleBay();
 
     this._resizeHandler = () => this.resize();
+    this._pauseHandler = () => this.togglePause();
+    this._visibilityHandler = () => {
+      if (
+        document.hidden &&
+        !this.paused &&
+        !this.props.multiplayer &&
+        this.raceState.status === 'racing'
+      ) {
+        this.togglePause();
+      }
+    };
     window.addEventListener('resize', this._resizeHandler);
+    document.addEventListener('game-pause', this._pauseHandler);
+    document.addEventListener('visibilitychange', this._visibilityHandler);
+    this._setupRaceUi();
   }
 
-  // Places a vehicle on the track and gives it control. Any previously
-  // controlled vehicle is left parked exactly where it stopped.
+  _setupRaceUi() {
+    const pauseDialog = document.getElementById('pause-dialog');
+    const resultsDialog = document.getElementById('results-dialog');
+    const pauseButton = document.getElementById('pause-btn');
+    pauseButton.disabled = this.props.multiplayer;
+    pauseButton.onclick = () => this.togglePause();
+    document.getElementById('resume-btn').onclick = () => this.resume();
+    document.getElementById('retry-btn').onclick = () => this.restartRace();
+    document.getElementById('quit-btn').onclick = () => {
+      this.resume(false);
+      restoreLobby(I18n.t('status.fallback'));
+    };
+    document.getElementById('results-retry-btn').onclick = () => this.restartRace();
+    document.getElementById('results-lobby-btn').onclick = () => {
+      resultsDialog.close();
+      restoreLobby(I18n.t('status.fallback'));
+    };
+    document.getElementById('pause-assist').onclick = () => {
+      this.setAssistEnabled(!this.assistEnabled);
+    };
+    pauseDialog.oncancel = (event) => {
+      event.preventDefault();
+      this.resume();
+    };
+    resultsDialog.oncancel = (event) => event.preventDefault();
+    this.setAssistEnabled(this.assistEnabled);
+    this._syncBestLapHud();
+  }
+
+  setAssistEnabled(enabled) {
+    this.assistEnabled = Boolean(enabled);
+    try {
+      window.localStorage.setItem('xrrc-steering-assist', String(this.assistEnabled));
+    } catch (error) {
+      console.warn('[race] Steering assist preference could not be saved:', error);
+    }
+    const button = document.getElementById('pause-assist');
+    const input = document.getElementById('steering-assist');
+    if (button) {
+      button.setAttribute('aria-pressed', String(this.assistEnabled));
+      button.querySelector('strong').textContent = I18n.t(
+        this.assistEnabled ? 'common.on' : 'common.off'
+      );
+    }
+    if (input) input.checked = this.assistEnabled;
+  }
+
+  togglePause() {
+    if (
+      this.props.multiplayer ||
+      !this.isPlaced ||
+      this.raceState.status !== 'racing'
+    ) {
+      return;
+    }
+    if (this.paused) {
+      this.resume();
+      return;
+    }
+    this.paused = true;
+    this.setActive(false);
+    const dialog = document.getElementById('pause-dialog');
+    if (!dialog.open) dialog.showModal();
+  }
+
+  resume(reactivate = true) {
+    const dialog = document.getElementById('pause-dialog');
+    if (dialog.open) dialog.close();
+    this.paused = false;
+    this.clock.getDelta();
+    if (reactivate && this.raceState.status === 'racing') this.setActive(true);
+  }
+
+  restartRace() {
+    for (const dialog of [
+      document.getElementById('pause-dialog'),
+      document.getElementById('results-dialog'),
+    ]) {
+      if (dialog.open) dialog.close();
+    }
+    this.paused = false;
+    this.countdownStarted = false;
+    this.localCar.reset();
+    this.lastSafePose = {
+      ...START_GRID,
+      y: this.localCar.group.position.y,
+    };
+    this.stuckTimer = 0;
+    this.boostCharge = 0;
+    this.boostTimer = 0;
+    this.wasDrifting = false;
+    this.skidMarks.clear();
+    this._resetAIRacers();
+    this._resetRaceState();
+    runCountdown(this);
+  }
+
+  beginRace() {
+    const race = this.raceState;
+    race.status = 'racing';
+    race.elapsedMs = 0;
+    race.lapElapsedMs = 0;
+    race.sectorStartedAt = 0;
+    this.ghostSamples = [];
+    this.ghostSampleTimer = 0;
+    this._recordGhostSample(true);
+    this.setActive(true);
+    this._broadcastRace();
+  }
+
+  _initAIRacers(countValue) {
+    const count = Core.clamp(Number.parseInt(countValue, 10) || 0, 0, 5);
+    for (let index = 0; index < count; index += 1) {
+      const avatar = new RaceAvatar(index < 2 ? AI_NAMES[index] : null, AI_COLORS[index]);
+      this.gameRoot.add(avatar.group);
+      this.aiRacers.push({
+        avatar,
+        baseSpeed: 1.18 + index * 0.045,
+        completedLaps: 0,
+        distance: -(index + 1) * 0.5,
+        finishTime: null,
+        finished: false,
+        id: `ai-${index}`,
+        lane: (index % 2 === 0 ? -1 : 1) * (0.13 + Math.floor(index / 2) * 0.035),
+        name: AI_NAMES[index],
+        progress: 0,
+        speed: 0,
+        startDistance: -(index + 1) * 0.5,
+      });
+    }
+    this._resetAIRacers();
+  }
+
+  _resetAIRacers() {
+    for (const racer of this.aiRacers) {
+      racer.completedLaps = 0;
+      racer.distance = racer.startDistance;
+      racer.finishTime = null;
+      racer.finished = false;
+      racer.progress = 0;
+      racer.speed = 0;
+      racer.avatar.knockback.x = 0;
+      racer.avatar.knockback.z = 0;
+      racer.avatar.offset.x = 0;
+      racer.avatar.offset.z = 0;
+      this._positionAIRacer(racer);
+    }
+  }
+
+  _coursePoseAtDistance(distance, lane = 0) {
+    const trackLength = this.trackCurve.getLength() * COURSE_SCALE;
+    const progress = distance / trackLength;
+    const raw = (
+      this.startProgress +
+      this.raceDirection * progress +
+      Math.ceil(Math.abs(progress)) +
+      1
+    ) % 1;
+    const point = this.trackCurve.getPointAt(raw).multiplyScalar(COURSE_SCALE);
+    const tangent = this.trackCurve.getTangentAt(raw).normalize();
+    const forwardX = tangent.x * this.raceDirection;
+    const forwardZ = tangent.z * this.raceDirection;
+    point.x += -forwardZ * lane;
+    point.z += forwardX * lane;
+    point.y = 0.055;
+    return {
+      heading: Math.atan2(-forwardX, -forwardZ),
+      point,
+      raw,
+      trackLength,
+    };
+  }
+
+  _positionAIRacer(racer) {
+    const pose = this._coursePoseAtDistance(racer.distance, racer.lane);
+    racer.avatar.velocity = racer.speed;
+    racer.avatar.setPose(pose.point, pose.heading);
+    return pose;
+  }
+
+  _updateAIRacers(delta) {
+    const race = this.raceState;
+    const playerDistance = (
+      race.completedLaps + race.progress
+    ) * this.trackCurve.getLength() * COURSE_SCALE;
+    for (const racer of this.aiRacers) {
+      const pose = this._coursePoseAtDistance(racer.distance, racer.lane);
+      if (race.status === 'racing' && !racer.finished) {
+        const nextRaw = (pose.raw + this.raceDirection * 0.018 + 1) % 1;
+        const tangent = this.trackCurve.getTangentAt(pose.raw).normalize();
+        const nextTangent = this.trackCurve.getTangentAt(nextRaw).normalize();
+        const curveFactor = 0.74 + Math.max(0, tangent.dot(nextTangent)) * 0.26;
+        const gap = playerDistance - racer.distance;
+        const rubberBand = gap > pose.trackLength * 0.18
+          ? 1.1
+          : gap < -pose.trackLength * 0.18
+            ? 0.93
+            : 1;
+        const targetSpeed = racer.baseSpeed * curveFactor * rubberBand;
+        racer.speed += (targetSpeed - racer.speed) * Math.min(1, delta * 2.8);
+        racer.distance += racer.speed * delta;
+        const totalProgress = Math.max(0, racer.distance / pose.trackLength);
+        racer.completedLaps = Math.min(this.totalLaps, Math.floor(totalProgress));
+        racer.progress = totalProgress % 1;
+        if (totalProgress >= this.totalLaps) {
+          racer.completedLaps = this.totalLaps;
+          racer.finishTime = race.elapsedMs;
+          racer.finished = true;
+          racer.progress = 0;
+          racer.distance = pose.trackLength * this.totalLaps;
+        }
+      }
+      this._positionAIRacer(racer);
+      racer.avatar.applyKnockback(delta);
+    }
+  }
+
+  _loadGhost() {
+    const ghost = this.raceSave.ghosts[this.track.id];
+    if (!ghost || !Array.isArray(ghost.samples) || ghost.samples.length < 2) return;
+    this.ghostData = ghost;
+    this.ghostAvatar = new RaceAvatar(null, 0xf1c644, true);
+    this.ghostAvatar.group.visible = false;
+    this.gameRoot.add(this.ghostAvatar.group);
+  }
+
+  _replaceGhost(ghost) {
+    if (this.ghostAvatar) this.ghostAvatar.dispose();
+    this.ghostData = ghost;
+    this.ghostAvatar = new RaceAvatar(null, 0xf1c644, true);
+    this.ghostAvatar.group.visible = false;
+    this.gameRoot.add(this.ghostAvatar.group);
+  }
+
+  _recordGhostSample(force = false) {
+    const race = this.raceState;
+    if (race.status !== 'racing' || race.finished) return;
+    if (!force && this.ghostSampleTimer < 0.08) return;
+    this.ghostSampleTimer = 0;
+    const position = this.localCar.group.position;
+    this.ghostSamples.push({
+      t: Math.round(race.lapElapsedMs),
+      x: Number(position.x.toFixed(4)),
+      y: Number(position.y.toFixed(4)),
+      z: Number(position.z.toFixed(4)),
+      ry: Number(this.localCar.group.rotation.y.toFixed(4)),
+    });
+    if (this.ghostSamples.length > 1800) this.ghostSamples.shift();
+  }
+
+  _updateGhost() {
+    if (!this.ghostAvatar || !this.ghostData || this.raceState.status !== 'racing') return;
+    const pose = RaceCore.interpolateGhost(
+      this.ghostData.samples,
+      this.raceState.lapElapsedMs
+    );
+    this.ghostAvatar.group.visible = Boolean(pose);
+    if (pose) this.ghostAvatar.setPose(pose, pose.ry);
+  }
+
+  _serializeRaceState() {
+    const race = this.raceState;
+    return {
+      attempt: race.attempt,
+      completedLaps: race.completedLaps,
+      elapsedMs: race.elapsedMs,
+      finishTime: race.finishTime,
+      finished: race.finished,
+      lap: race.lap,
+      lapTimes: [...race.lapTimes],
+      nextCheckpoint: race.nextCheckpoint,
+      progress: race.progress,
+      revision: race.revision,
+      totalLaps: this.totalLaps,
+    };
+  }
+
+  adoptRaceRules(race) {
+    if (
+      !race ||
+      this.raceState.completedLaps > 0 ||
+      !Number.isFinite(race.totalLaps)
+    ) {
+      return false;
+    }
+    const nextTotal = RaceCore.normalizeLapCount(race.totalLaps, this.totalLaps);
+    if (nextTotal === this.totalLaps) return false;
+    this.totalLaps = nextTotal;
+    document.getElementById('lap-count').value = String(nextTotal);
+    this._syncRaceHud(this.localCar.surface || 'road');
+    this._syncStandings();
+    setupShareLink(getRoom(), getSignalValue(), this.track.id);
+    return true;
+  }
+
+  _broadcastRace() {
+    this.raceState.revision += 1;
+    const state = this._serializeRaceState();
+    this.localCar.networkRaceState = state;
+    if (networkManager) networkManager.broadcastRace(state);
+  }
+
+  // Places the selected vehicle at the current race position and returns
+  // the previous vehicle to its fixed paddock stall.
   _summonVehicle(type, { silent = false } = {}) {
     const nextType = normalizeVehicleSelection(type);
     if (this.worldCars.has(nextType)) return this.worldCars.get(nextType);
 
-    if (this.localCar) this.localCar.setActive(false);
+    const previous = this.localCar;
+    const spawn = previous
+      ? {
+          x: previous.group.position.x,
+          z: previous.group.position.z,
+          heading: previous.group.rotation.y,
+        }
+      : START_GRID;
+    if (previous) {
+      previous.setActive(false);
+      const stall = pitStallPosition(previous.type);
+      previous.reset(stall.x, stall.z, stall.heading);
+      previous.setActive(false);
+    }
 
     const car = new Vehicle(0xe84a27, true, nextType);
-    const spot = pitStallPosition(nextType);
-    car.reset(spot.x, spot.z, spot.heading);
+    car.reset(spawn.x, spawn.z, spawn.heading);
     car.setActive(true);
     this.gameRoot.add(car.group);
     this.worldCars.set(nextType, car);
     this.localCar = car;
+    document.documentElement.dataset.vehicleCategory = car.spec.category;
 
     const label = document.getElementById('vehicle-label');
     if (label) label.textContent = I18n.t(`vehicle.${nextType}`);
@@ -1136,13 +1975,13 @@ class Game {
     return new THREE.MeshStandardMaterial({ color, roughness, metalness });
   }
 
-  _addMesh(geometry, material, position, rotation = null, parent = this.gameRoot) {
+  _addMesh(geometry, material, position, rotation = null, parent = null) {
     const mesh = new THREE.Mesh(geometry, material);
     mesh.position.copy(position);
     if (rotation) mesh.rotation.set(rotation.x, rotation.y, rotation.z);
     mesh.castShadow = true;
     mesh.receiveShadow = true;
-    parent.add(mesh);
+    (parent || this.courseRoot).add(mesh);
     return mesh;
   }
 
@@ -1161,18 +2000,65 @@ class Game {
     mesh.castShadow = options.castShadow ?? true;
     mesh.receiveShadow = options.receiveShadow ?? true;
     mesh.computeBoundingSphere();
-    (options.parent || this.gameRoot).add(mesh);
+    (options.parent || this.courseRoot).add(mesh);
     return mesh;
   }
 
+  _registerStaticOBB(x, z, halfX, halfZ, rotation, height, label) {
+    this.staticColliders.push(Object.freeze({
+      height: Math.max(0.04, height * COURSE_SCALE),
+      hx: Math.max(0.02, halfX * COURSE_SCALE),
+      hz: Math.max(0.02, halfZ * COURSE_SCALE),
+      label,
+      theta: -rotation,
+      x: x * COURSE_SCALE,
+      z: z * COURSE_SCALE,
+    }));
+  }
+
+  _registerStaticCircle(x, z, radius, height, label) {
+    this._registerStaticOBB(x, z, radius, radius, 0, height, label);
+  }
+
+  _buildCourseSamples() {
+    this.trackSamples = Array.from({ length: COURSE_SAMPLE_COUNT }, (_, index) => {
+      const point = this.trackCurve.getPointAt(index / COURSE_SAMPLE_COUNT);
+      return Object.freeze({
+        x: point.x * COURSE_SCALE,
+        z: point.z * COURSE_SCALE,
+      });
+    });
+    const startSurface = this._sampleSurface(START_GRID);
+    this.startProgress = startSurface.progress;
+    const forwardX = -Math.sin(START_GRID.heading);
+    const forwardZ = -Math.cos(START_GRID.heading);
+    this.raceDirection = (
+      forwardX * startSurface.tangent.x +
+      forwardZ * startSurface.tangent.z
+    ) >= 0 ? 1 : -1;
+  }
+
+  _sampleSurface(position) {
+    return Core.sampleCourseSurface(
+      position,
+      this.trackSamples,
+      this.roadWidth,
+      STUNT_LANE
+    );
+  }
+
   _buildTrack() {
-    const grass = this._standardMaterial(0x718956, 0.98, 0);
-    const dirt = this._standardMaterial(0xa68f60, 1, 0);
-    const asphalt = this._standardMaterial(0x3f413a, 0.94, 0.02);
-    const white = this._standardMaterial(0xeee2c8, 0.82, 0);
-    const red = this._standardMaterial(0xd9442b, 0.72, 0.08);
-    const yellow = this._standardMaterial(0xf1c644, 0.76, 0.04);
-    const dark = this._standardMaterial(0x24251f, 0.84, 0.08);
+    const { palette, points, roadWidth } = this.track;
+    const localRoadWidth = roadWidth / COURSE_SCALE;
+    const grass = this._standardMaterial(palette.ground, 0.98, 0);
+    const dirt = this._standardMaterial(palette.shoulder, 1, 0);
+    const asphalt = this._standardMaterial(palette.road, 0.94, 0.02);
+    const white = this._standardMaterial(palette.line, 0.82, 0);
+    const red = this._standardMaterial(palette.curbA, 0.72, 0.08);
+    const curbB = this._standardMaterial(palette.curbB, 0.78, 0.04);
+    const yellow = this._standardMaterial(palette.accent, 0.76, 0.04);
+    const dark = this._standardMaterial(palette.dark, 0.84, 0.08);
+    this.roadWidth = roadWidth;
 
     const ground = this._addMesh(
       new THREE.PlaneGeometry(8.8, 6.8),
@@ -1182,43 +2068,37 @@ class Game {
     );
     ground.castShadow = false;
 
-    this.trackCurve = new THREE.CatmullRomCurve3([
-      new THREE.Vector3(-3.35, 0, -1.15),
-      new THREE.Vector3(-2.25, 0, -2.25),
-      new THREE.Vector3(-0.25, 0, -2.52),
-      new THREE.Vector3(1.95, 0, -2.28),
-      new THREE.Vector3(3.25, 0, -1.35),
-      new THREE.Vector3(3.48, 0, 0.05),
-      new THREE.Vector3(3.05, 0, 1.48),
-      new THREE.Vector3(1.65, 0, 2.43),
-      new THREE.Vector3(0.25, 0, 2.12),
-      new THREE.Vector3(-1.25, 0, 2.52),
-      new THREE.Vector3(-3.05, 0, 1.68),
-      new THREE.Vector3(-3.48, 0, 0.25),
-    ], true, 'centripetal', 0.45);
+    this.trackCurve = new THREE.CatmullRomCurve3(
+      points.map(([x, z]) => new THREE.Vector3(x, 0, z)),
+      true,
+      'centripetal',
+      0.45
+    );
+    this._buildCourseSamples();
 
     const shoulder = this._addMesh(
-      this._createRoadGeometry(this.trackCurve, ROAD_WIDTH + 0.24),
+      this._createRoadGeometry(this.trackCurve, localRoadWidth + 0.24 / COURSE_SCALE),
       dirt,
       new THREE.Vector3(0, -0.002, 0)
     );
     shoulder.castShadow = false;
     const road = this._addMesh(
-      this._createRoadGeometry(this.trackCurve, ROAD_WIDTH),
+      this._createRoadGeometry(this.trackCurve, localRoadWidth),
       asphalt,
       new THREE.Vector3(0, 0.006, 0)
     );
     this.road = road;
     road.castShadow = false;
-    this._addCourseDetails(this.trackCurve, white, red);
+    this._addCourseDetails(this.trackCurve, white, red, curbB, localRoadWidth);
     this._addStartGrid(white, dark);
     this._addStuntLane(dirt, yellow, dark);
     this._addBarrier(-2.55, -2.92, 1.4, 0.08, red, white);
     this._addBarrier(2.55, 2.92, 1.2, -0.08, yellow, dark);
     this._addTireWall(-3.95, 0.35, 0.9, Math.PI / 2, dark);
     this._addTireWall(3.78, -0.85, 0.9, Math.PI / 2, dark);
+    this._addTracksideMarkers(yellow, dark);
     this._addBillboard(yellow, dark);
-    this._addTrees();
+    this._addThemeScenery();
 
     if (this.props.jump) this._addJump(red, yellow);
     if (this.props.loop) this._addLoop(yellow, red);
@@ -1262,7 +2142,7 @@ class Game {
     return geometry;
   }
 
-  _addCourseDetails(curve, white, red) {
+  _addCourseDetails(curve, line, curbA, curbB, roadWidth) {
     const samples = 120;
     const markerTransforms = [];
     const whiteCurbTransforms = [];
@@ -1290,9 +2170,9 @@ class Game {
           );
           transforms.push({
             position: new THREE.Vector3(
-              point.x + normal.x * (ROAD_WIDTH / 2 + 0.025) * side,
+              point.x + normal.x * (roadWidth / 2 + 0.025) * side,
               0.018,
-              point.z + normal.z * (ROAD_WIDTH / 2 + 0.025) * side
+              point.z + normal.z * (roadWidth / 2 + 0.025) * side
             ),
             rotation: new THREE.Euler(0, rotation, 0),
           });
@@ -1301,13 +2181,13 @@ class Game {
     }
     this._addInstances(
       new THREE.BoxGeometry(0.24, 0.012, 0.035),
-      white,
+      line,
       markerTransforms,
       { castShadow: false }
     );
     const curbGeometry = new THREE.BoxGeometry(0.2, 0.035, 0.075);
-    this._addInstances(curbGeometry, white, whiteCurbTransforms);
-    this._addInstances(curbGeometry.clone(), red, redCurbTransforms);
+    this._addInstances(curbGeometry, curbB, whiteCurbTransforms);
+    this._addInstances(curbGeometry.clone(), curbA, redCurbTransforms);
   }
 
   _addStartGrid(white, dark) {
@@ -1318,9 +2198,9 @@ class Game {
         const transforms = (row + column) % 2 ? darkTiles : whiteTiles;
         transforms.push({
           position: new THREE.Vector3(
-            START_GRID.x + (row - 2) * 0.11,
+            BASE_START_GRID.x + (row - 2) * 0.11,
             0.022,
-            START_GRID.z + (column - 4.5) * 0.11
+            BASE_START_GRID.z + (column - 4.5) * 0.11
           ),
         });
       }
@@ -1384,6 +2264,7 @@ class Game {
     const geometry = new THREE.BoxGeometry(length / count + 0.015, 0.13, 0.09);
     this._addInstances(geometry, firstMaterial, firstTransforms);
     this._addInstances(geometry.clone(), secondMaterial, secondTransforms);
+    this._registerStaticOBB(x, z, length / 2, 0.055, rotation, 0.14, 'barrier');
   }
 
   _addTireWall(x, z, length, rotation, material) {
@@ -1407,6 +2288,38 @@ class Game {
       material,
       transforms
     );
+    this._registerStaticOBB(x, z, length / 2, 0.1, rotation, 0.14, 'tire-wall');
+  }
+
+  _addTracksideMarkers(accent, dark) {
+    const locations = [
+      [-3.92, -2.15, 0.08],
+      [-2.55, -2.92, -0.04],
+      [2.65, -2.9, 0.04],
+      [3.92, -1.82, -0.08],
+      [3.9, 1.88, 0.08],
+      [2.48, 2.96, -0.04],
+      [-2.58, 2.95, 0.04],
+      [-3.94, 1.96, -0.08],
+    ];
+    this._addInstances(
+      new THREE.BoxGeometry(0.04, 0.7, 0.04),
+      dark,
+      locations.map(([x, z]) => ({
+        position: new THREE.Vector3(x, 0.35, z),
+      }))
+    );
+    this._addInstances(
+      new THREE.BoxGeometry(0.3, 0.16, 0.045),
+      accent,
+      locations.map(([x, z, rotation]) => ({
+        position: new THREE.Vector3(x, 0.68, z),
+        rotation: new THREE.Euler(0, rotation, -0.08),
+      }))
+    );
+    for (const [x, z] of locations) {
+      this._registerStaticCircle(x, z, 0.04, 0.72, 'course-marker');
+    }
   }
 
   _addBillboard(yellow, dark) {
@@ -1414,13 +2327,14 @@ class Game {
     canvas.width = 768;
     canvas.height = 192;
     const context = canvas.getContext('2d');
-    context.fillStyle = '#f1c644';
+    const toCssColor = (color) => `#${color.toString(16).padStart(6, '0')}`;
+    context.fillStyle = toCssColor(this.track.palette.accent);
     context.fillRect(0, 0, canvas.width, canvas.height);
-    context.fillStyle = '#24251f';
+    context.fillStyle = toCssColor(this.track.palette.dark);
     context.font = '900 88px sans-serif';
     context.textAlign = 'center';
     context.textBaseline = 'middle';
-    context.fillText('XRRC // DIRT LAB', canvas.width / 2, canvas.height / 2);
+    context.fillText(this.track.sign, canvas.width / 2, canvas.height / 2);
     const texture = new THREE.CanvasTexture(canvas);
     texture.colorSpace = THREE.SRGBColorSpace;
     const sign = this._addMesh(
@@ -1444,21 +2358,59 @@ class Game {
       yellow,
       new THREE.Vector3(0.15, 1.29, -3.12)
     );
+    this._registerStaticCircle(-1.1, -3.12, 0.055, 1.1, 'billboard-post');
+    this._registerStaticCircle(1.4, -3.12, 0.055, 1.1, 'billboard-post');
   }
 
-  _addTrees() {
-    const trunkMaterial = this._standardMaterial(0x6f5137, 1, 0);
-    const leafMaterials = [
-      this._standardMaterial(0x587047, 0.95, 0),
-      this._standardMaterial(0x768d55, 0.95, 0),
-    ];
-    const locations = [
-      [-4.05, -2.72, 1],
-      [4.03, -2.72, 0.9],
-      [-4.08, 2.62, 1.15],
-      [-0.9, -3.05, 0.75],
-      [2.65, 3.02, 0.8],
-    ];
+  _addThemeScenery() {
+    if (this.track.scenery === 'backyard') {
+      this._addConifers(
+        [
+          [-4.05, -2.72, 1],
+          [4.03, -2.72, 0.9],
+          [-4.08, 2.62, 1.15],
+          [-0.9, -3.05, 0.75],
+          [2.65, 3.02, 0.8],
+        ],
+        0x6f5137,
+        [0x587047, 0x768d55]
+      );
+      return;
+    }
+    if (this.track.scenery === 'alpine') {
+      this._addConifers(
+        [
+          [-4.05, -2.68, 1.15],
+          [4.02, -2.66, 0.95],
+          [-4.05, 2.62, 1.25],
+          [3.98, 2.62, 1.08],
+          [-0.95, -3.08, 0.8],
+          [2.62, 3.02, 0.86],
+        ],
+        0x594b43,
+        [0x355b5c, 0x467275],
+        0xe8f0ed
+      );
+      return;
+    }
+    if (this.track.scenery === 'desert') {
+      this._addDesertScenery();
+      return;
+    }
+    if (this.track.scenery === 'harbor') {
+      this._addHarborScenery();
+      return;
+    }
+    if (this.track.scenery === 'sakura') {
+      this._addSakuraScenery();
+      return;
+    }
+    this._addLunarScenery();
+  }
+
+  _addConifers(locations, trunkColor, foliageColors, snowColor = null) {
+    const trunkMaterial = this._standardMaterial(trunkColor, 1, 0);
+    const leafMaterials = foliageColors.map((color) => this._standardMaterial(color, 0.95, 0));
     const trunkTransforms = [];
     const leafTransforms = [[], []];
     for (const [index, [x, z, scale]] of locations.entries()) {
@@ -1479,35 +2431,351 @@ class Game {
     const leafGeometry = new THREE.ConeGeometry(0.38, 0.78, 9);
     this._addInstances(leafGeometry, leafMaterials[0], leafTransforms[0]);
     this._addInstances(leafGeometry.clone(), leafMaterials[1], leafTransforms[1]);
+    if (snowColor !== null) {
+      this._addInstances(
+        new THREE.ConeGeometry(0.3, 0.36, 9),
+        this._standardMaterial(snowColor, 0.9, 0),
+        locations.map(([x, z, scale]) => ({
+          position: new THREE.Vector3(x, 0.86 * scale, z),
+          scale: new THREE.Vector3(scale, scale, scale),
+        }))
+      );
+    }
+    for (const [x, z, scale] of locations) {
+      this._registerStaticCircle(x, z, 0.09 * scale, 1.08 * scale, 'tree');
+    }
+  }
+
+  _addDesertScenery() {
+    const cactusMaterial = this._standardMaterial(0x47705a, 0.96, 0);
+    const locations = [
+      [-4.05, -2.65, 1],
+      [4.02, -2.58, 0.86],
+      [-4.08, 2.58, 1.12],
+      [3.98, 2.6, 0.94],
+      [-0.9, -3.08, 0.72],
+    ];
+    this._addInstances(
+      new THREE.CylinderGeometry(0.065, 0.085, 0.58, 9),
+      cactusMaterial,
+      locations.map(([x, z, scale]) => ({
+        position: new THREE.Vector3(x, 0.29 * scale, z),
+        scale: new THREE.Vector3(scale, scale, scale),
+      }))
+    );
+    const arms = [];
+    for (const [x, z, scale] of locations) {
+      arms.push(
+        {
+          position: new THREE.Vector3(x - 0.12 * scale, 0.34 * scale, z),
+          rotation: new THREE.Euler(0, 0, Math.PI / 2),
+          scale: new THREE.Vector3(scale, scale, scale),
+        },
+        {
+          position: new THREE.Vector3(x + 0.1 * scale, 0.43 * scale, z),
+          rotation: new THREE.Euler(0, 0, Math.PI / 2),
+          scale: new THREE.Vector3(scale * 0.72, scale * 0.72, scale * 0.72),
+        }
+      );
+    }
+    this._addInstances(
+      new THREE.CylinderGeometry(0.045, 0.055, 0.28, 9),
+      cactusMaterial,
+      arms
+    );
+    this._addInstances(
+      new THREE.DodecahedronGeometry(0.2, 0),
+      this._standardMaterial(0x8e5435, 1, 0),
+      [
+        [-3.85, 0.65, 1.2, 0.62],
+        [3.88, 0.72, 0.9, 0.48],
+        [-2.35, 3.02, 1.1, 0.52],
+        [2.5, -3.0, 0.95, 0.46],
+      ].map(([x, z, sx, sy]) => ({
+        position: new THREE.Vector3(x, 0.11, z),
+        rotation: new THREE.Euler(0.1, x, -0.08),
+        scale: new THREE.Vector3(sx, sy, 0.86),
+      }))
+    );
+    for (const [x, z, scale] of locations) {
+      this._registerStaticCircle(x, z, 0.09 * scale, 0.65 * scale, 'cactus');
+    }
+    for (const [x, z, sx, sy] of [
+      [-3.85, 0.65, 1.2, 0.62],
+      [3.88, 0.72, 0.9, 0.48],
+      [-2.35, 3.02, 1.1, 0.52],
+      [2.5, -3.0, 0.95, 0.46],
+    ]) {
+      this._registerStaticCircle(x, z, 0.2 * Math.max(sx, 0.86), 0.3 * sy, 'rock');
+    }
+  }
+
+  _addHarborScenery() {
+    const containerGeometry = new THREE.BoxGeometry(0.92, 0.48, 0.44);
+    const containerGroups = [[], []];
+    [
+      [-3.78, -2.86, 0.04, 0],
+      [3.72, -2.83, -0.08, 1],
+      [-3.8, 2.84, -0.03, 1],
+      [3.76, 2.82, 0.06, 0],
+    ].forEach(([x, z, rotation, group]) => {
+      containerGroups[group].push({
+        position: new THREE.Vector3(x, 0.24, z),
+        rotation: new THREE.Euler(0, rotation, 0),
+      });
+    });
+    this._addInstances(
+      containerGeometry,
+      this._standardMaterial(0xb44b35, 0.72, 0.15),
+      containerGroups[0]
+    );
+    this._addInstances(
+      containerGeometry.clone(),
+      this._standardMaterial(0x536f76, 0.72, 0.15),
+      containerGroups[1]
+    );
+    for (const [x, z, rotation] of [
+      [-3.78, -2.86, 0.04],
+      [3.72, -2.83, -0.08],
+      [-3.8, 2.84, -0.03],
+      [3.76, 2.82, 0.06],
+    ]) {
+      this._registerStaticOBB(x, z, 0.46, 0.22, rotation, 0.48, 'container');
+    }
+
+    const lightLocations = [
+      [-4.02, -0.35],
+      [4.02, 0.4],
+      [-0.72, -3.08],
+      [2.55, 3.02],
+    ];
+    this._addInstances(
+      new THREE.CylinderGeometry(0.025, 0.035, 0.82, 8),
+      this._standardMaterial(0x161d23, 0.76, 0.28),
+      lightLocations.map(([x, z]) => ({
+        position: new THREE.Vector3(x, 0.41, z),
+      }))
+    );
+    const lampColor = this.track.palette.accent;
+    this._addInstances(
+      new THREE.SphereGeometry(0.07, 12, 8),
+      new THREE.MeshStandardMaterial({
+        color: lampColor,
+        emissive: lampColor,
+        emissiveIntensity: 2.2,
+        roughness: 0.5,
+      }),
+      lightLocations.map(([x, z]) => ({
+        position: new THREE.Vector3(x, 0.84, z),
+      })),
+      { castShadow: false }
+    );
+    for (const [x, z] of lightLocations) {
+      this._registerStaticCircle(x, z, 0.04, 0.86, 'light-pole');
+    }
+  }
+
+  _addSakuraScenery() {
+    const locations = [
+      [-4.02, -2.68, 1],
+      [4, -2.68, 0.88],
+      [-4.04, 2.62, 1.12],
+      [3.98, 2.65, 0.96],
+      [-0.88, -3.05, 0.76],
+      [2.62, 3.02, 0.82],
+    ];
+    this._addInstances(
+      new THREE.CylinderGeometry(0.05, 0.075, 0.5, 8),
+      this._standardMaterial(0x71504a, 1, 0),
+      locations.map(([x, z, scale]) => ({
+        position: new THREE.Vector3(x, 0.25 * scale, z),
+        scale: new THREE.Vector3(scale, scale, scale),
+      }))
+    );
+    const blossomTransforms = [[], []];
+    locations.forEach(([x, z, scale], index) => {
+      blossomTransforms[index % 2].push({
+        position: new THREE.Vector3(x, 0.67 * scale, z),
+        scale: new THREE.Vector3(0.44 * scale, 0.29 * scale, 0.4 * scale),
+      });
+    });
+    const blossomGeometry = new THREE.IcosahedronGeometry(1, 1);
+    this._addInstances(
+      blossomGeometry,
+      this._standardMaterial(0xe7a0af, 0.9, 0),
+      blossomTransforms[0]
+    );
+    this._addInstances(
+      blossomGeometry.clone(),
+      this._standardMaterial(0xf1c0c8, 0.9, 0),
+      blossomTransforms[1]
+    );
+
+    const lanternLocations = [
+      [-3.9, 0.58],
+      [3.9, -0.68],
+      [-2.38, 2.96],
+      [2.38, -3.0],
+    ];
+    this._addInstances(
+      new THREE.CylinderGeometry(0.025, 0.035, 0.54, 8),
+      this._standardMaterial(0x3b3134, 0.86, 0.08),
+      lanternLocations.map(([x, z]) => ({
+        position: new THREE.Vector3(x, 0.27, z),
+      }))
+    );
+    this._addInstances(
+      new THREE.BoxGeometry(0.13, 0.18, 0.13),
+      new THREE.MeshStandardMaterial({
+        color: 0xf4d0b0,
+        emissive: 0xd66f85,
+        emissiveIntensity: 0.75,
+        roughness: 0.72,
+      }),
+      lanternLocations.map(([x, z]) => ({
+        position: new THREE.Vector3(x, 0.59, z),
+      })),
+      { castShadow: false }
+    );
+    for (const [x, z, scale] of locations) {
+      this._registerStaticCircle(x, z, 0.09 * scale, 1.02 * scale, 'sakura-tree');
+    }
+    for (const [x, z] of lanternLocations) {
+      this._registerStaticCircle(x, z, 0.045, 0.68, 'lantern');
+    }
+  }
+
+  _addLunarScenery() {
+    this._addInstances(
+      new THREE.TorusGeometry(0.18, 0.035, 8, 24),
+      this._standardMaterial(0x565a63, 1, 0),
+      [
+        [-3.88, -2.7, 1.2],
+        [3.86, 2.7, 0.88],
+        [-0.82, -3.05, 0.72],
+        [3.94, -0.18, 0.8],
+        [-3.94, 0.92, 0.68],
+      ].map(([x, z, scale]) => ({
+        position: new THREE.Vector3(x, 0.012, z),
+        rotation: new THREE.Euler(Math.PI / 2, 0, 0),
+        scale: new THREE.Vector3(scale, scale, scale),
+      })),
+      { castShadow: false }
+    );
+    this._addInstances(
+      new THREE.DodecahedronGeometry(0.13, 0),
+      this._standardMaterial(0x8e9198, 1, 0),
+      [
+        [-4.08, -1.8, 1.1],
+        [4.05, -1.7, 0.75],
+        [-4.02, 2.48, 0.9],
+        [4.02, 2.42, 1.2],
+        [2.58, 3.04, 0.72],
+      ].map(([x, z, scale]) => ({
+        position: new THREE.Vector3(x, 0.1 * scale, z),
+        rotation: new THREE.Euler(x * 0.1, z * 0.2, x * 0.05),
+        scale: new THREE.Vector3(scale, scale * 0.7, scale * 0.9),
+      }))
+    );
+    const beaconLocations = [
+      [-3.98, -0.3],
+      [3.98, 0.42],
+      [-2.55, 2.98],
+      [2.48, -3.02],
+    ];
+    this._addInstances(
+      new THREE.CylinderGeometry(0.025, 0.045, 0.42, 8),
+      this._standardMaterial(0x252a33, 0.58, 0.42),
+      beaconLocations.map(([x, z]) => ({
+        position: new THREE.Vector3(x, 0.21, z),
+      }))
+    );
+    this._addInstances(
+      new THREE.SphereGeometry(0.055, 10, 8),
+      new THREE.MeshStandardMaterial({
+        color: 0xe0b642,
+        emissive: 0xe0b642,
+        emissiveIntensity: 1.8,
+        roughness: 0.5,
+      }),
+      beaconLocations.map(([x, z]) => ({
+        position: new THREE.Vector3(x, 0.45, z),
+      })),
+      { castShadow: false }
+    );
+    for (const [x, z, scale] of [
+      [-4.08, -1.8, 1.1],
+      [4.05, -1.7, 0.75],
+      [-4.02, 2.48, 0.9],
+      [4.02, 2.42, 1.2],
+      [2.58, 3.04, 0.72],
+    ]) {
+      this._registerStaticCircle(x, z, 0.14 * scale, 0.24 * scale, 'lunar-rock');
+    }
+    for (const [x, z] of beaconLocations) {
+      this._registerStaticCircle(x, z, 0.045, 0.5, 'beacon');
+    }
   }
 
   _addJump(red, yellow) {
-    const ramp = this._addMesh(
+    const ramps = [
+      [-1.55, 0.08, 1, 0.31],
+      [-0.42, -0.16, 0.7, 0.24],
+      [-0.42, 0.32, 0.7, 0.24],
+      [1.95, 0.08, 0.88, -0.27],
+    ];
+    this.jumpMesh = this._addInstances(
       new THREE.BoxGeometry(0.72, 0.055, 0.55),
       red,
-      new THREE.Vector3(RAMP_ZONE.x, 0.12, RAMP_ZONE.z),
-      new THREE.Euler(0, 0, 0.31)
+      ramps.map(([x, z, scale, tilt]) => ({
+        position: new THREE.Vector3(x, 0.12 * scale, z),
+        rotation: new THREE.Euler(0, 0, tilt),
+        scale: new THREE.Vector3(scale, scale, scale),
+      }))
     );
-    const stripe = this._addMesh(
+    this._addInstances(
       new THREE.BoxGeometry(0.1, 0.012, 0.56),
       yellow,
-      new THREE.Vector3(RAMP_ZONE.x + 0.2, 0.19, RAMP_ZONE.z),
-      new THREE.Euler(0, 0, 0.31)
+      ramps.map(([x, z, scale, tilt]) => ({
+        position: new THREE.Vector3(
+          x + Math.cos(tilt) * 0.2 * scale,
+          0.19 * scale,
+          z
+        ),
+        rotation: new THREE.Euler(0, 0, tilt),
+        scale: new THREE.Vector3(scale, scale, scale),
+      })),
+      { castShadow: false }
     );
-    ramp.castShadow = true;
-    stripe.castShadow = false;
   }
 
   _addLoop(yellow, red) {
     const loop = this._addMesh(
       new THREE.TorusGeometry(0.5, 0.055, 14, 64),
       yellow,
-      new THREE.Vector3(0.95, 0.52, 0.08)
+      new THREE.Vector3(0.95, 0.52, 0.08),
+      new THREE.Euler(0, 0, 0)
     );
+    loop.name = 'stunt-loop';
+    this.stuntLoop = loop;
     const base = this._addMesh(
       new THREE.BoxGeometry(0.32, 0.065, 0.7),
       red,
       new THREE.Vector3(0.95, 0.032, 0.08)
+    );
+    this._addInstances(
+      new THREE.BoxGeometry(0.58, 0.035, 0.08),
+      red,
+      [
+        {
+          position: new THREE.Vector3(0.45, 0.025, 0.08),
+          rotation: new THREE.Euler(0, 0, 0.08),
+        },
+        {
+          position: new THREE.Vector3(1.45, 0.025, 0.08),
+          rotation: new THREE.Euler(0, 0, -0.08),
+        },
+      ]
     );
     loop.castShadow = true;
     base.receiveShadow = true;
@@ -1555,6 +2823,16 @@ class Game {
       dark,
       coneBases
     );
+    for (const [x, z] of [
+      [-3.62, -1.45],
+      [-3.78, -1.18],
+      [3.46, -1.7],
+      [3.58, -1.42],
+      [-3.44, 1.9],
+      [3.5, 1.82],
+    ]) {
+      this._registerStaticCircle(x, z, 0.065, 0.18, 'traffic-cone');
+    }
 
     this._addStartGantry(dark, red, yellow);
     this._addParkedCar(3.55, 2.63, 0x4b7a95, Math.PI / 2, dark);
@@ -1582,21 +2860,36 @@ class Game {
       paddock.add(post);
     }
     paddock.position.set(3.58, 0, 2.55);
-    this.gameRoot.add(paddock);
+    this.courseRoot.add(paddock);
+    for (const [x, z] of [
+      [3.03, 2.26],
+      [4.13, 2.26],
+      [3.03, 2.84],
+      [4.13, 2.84],
+    ]) {
+      this._registerStaticCircle(x, z, 0.04, 0.64, 'paddock-post');
+    }
   }
 
   _addStartGantry(dark, red, yellow) {
-    for (const z of [START_GRID.z - 0.78, START_GRID.z + 0.78]) {
+    for (const z of [BASE_START_GRID.z - 0.78, BASE_START_GRID.z + 0.78]) {
       this._addMesh(
         new THREE.BoxGeometry(0.055, 0.95, 0.055),
         dark,
-        new THREE.Vector3(START_GRID.x + 0.12, 0.475, z)
+        new THREE.Vector3(BASE_START_GRID.x + 0.12, 0.475, z)
+      );
+      this._registerStaticCircle(
+        BASE_START_GRID.x + 0.12,
+        z,
+        0.055,
+        0.95,
+        'start-gantry'
       );
     }
     this._addMesh(
       new THREE.BoxGeometry(0.065, 0.065, 1.62),
       dark,
-      new THREE.Vector3(START_GRID.x + 0.12, 0.9, START_GRID.z)
+      new THREE.Vector3(BASE_START_GRID.x + 0.12, 0.9, BASE_START_GRID.z)
     );
     for (let index = 0; index < 5; index += 1) {
       const color = index < 2 ? red.color : index < 4 ? yellow.color : 0x4c9b62;
@@ -1608,21 +2901,21 @@ class Game {
           emissiveIntensity: index === 4 ? 1.6 : 0.25,
         }),
         new THREE.Vector3(
-          START_GRID.x + 0.06,
+          BASE_START_GRID.x + 0.06,
           0.82,
-          START_GRID.z - 0.42 + index * 0.21
+          BASE_START_GRID.z - 0.42 + index * 0.21
         )
       );
     }
     this._addMesh(
       new THREE.BoxGeometry(0.11, 0.035, 1.6),
       red,
-      new THREE.Vector3(START_GRID.x + 0.12, 0.99, START_GRID.z)
+      new THREE.Vector3(BASE_START_GRID.x + 0.12, 0.99, BASE_START_GRID.z)
     );
     this._addMesh(
       new THREE.BoxGeometry(0.11, 0.025, 1.6),
       yellow,
-      new THREE.Vector3(START_GRID.x + 0.12, 1.04, START_GRID.z)
+      new THREE.Vector3(BASE_START_GRID.x + 0.12, 1.04, BASE_START_GRID.z)
     );
   }
 
@@ -1653,19 +2946,25 @@ class Game {
     }
     car.position.set(x, 0, z);
     car.rotation.y = rotation;
-    this.gameRoot.add(car);
+    this.courseRoot.add(car);
+    this._registerStaticOBB(x, z, 0.11, 0.18, rotation, 0.2, 'parked-car');
   }
 
   _addLights() {
-    this.scene.add(new THREE.HemisphereLight(0xfff0d0, 0x5f7650, 2.2));
-    const sun = new THREE.DirectionalLight(0xffe5b5, 3.1);
-    sun.position.set(4.5, 8.5, 5.4);
+    const light = this.track.lighting;
+    this.scene.add(new THREE.HemisphereLight(
+      light.hemisphereSky,
+      light.hemisphereGround,
+      light.hemisphereIntensity
+    ));
+    const sun = new THREE.DirectionalLight(light.sun, light.sunIntensity);
+    sun.position.set(6.5, 11, 7);
     sun.castShadow = !this.isQuest;
     sun.shadow.mapSize.set(2048, 2048);
-    sun.shadow.camera.left = -5;
-    sun.shadow.camera.right = 5;
-    sun.shadow.camera.top = 5;
-    sun.shadow.camera.bottom = -5;
+    sun.shadow.camera.left = -7;
+    sun.shadow.camera.right = 7;
+    sun.shadow.camera.top = 6;
+    sun.shadow.camera.bottom = -6;
     this.scene.add(sun);
   }
 
@@ -1711,7 +3010,34 @@ class Game {
   }
 
   resetCar() {
+    for (const [type, car] of this.worldCars) {
+      if (car === this.localCar) continue;
+      const distanceToGrid = Math.hypot(
+        car.group.position.x - START_GRID.x,
+        car.group.position.z - START_GRID.z
+      );
+      if (distanceToGrid < 1.05) {
+        const stall = pitStallPosition(type);
+        car.reset(stall.x, stall.z, stall.heading);
+        car.setActive(false);
+      }
+    }
     this.localCar.reset();
+    this.lastSafePose = {
+      ...START_GRID,
+      y: this.localCar.group.position.y,
+    };
+    this.stuckTimer = 0;
+    this.raceState.nextCheckpoint = 0;
+    this.raceState.progress = 0;
+    this.raceState.lastProgress = 0;
+    this.raceState.started = false;
+    this.raceState.wasOnRoad = true;
+    this.raceState.wrongWay = false;
+    this.raceState.currentSectorTimes = [];
+    this.raceState.sectorStartedAt = 0;
+    this._syncRaceHud('road');
+    this._broadcastRace();
     this.particles.burst(
       this.localCar.group.position.clone(),
       [0xf1c644, 0xe84a27, 0xf4ead2],
@@ -1724,8 +3050,8 @@ class Game {
 
   startDesktop() {
     this.desktopMode = true;
-    this.scene.background = new THREE.Color(0xb9d4ce);
-    this.scene.fog = new THREE.Fog(0xb9d4ce, 12, 25);
+    this.scene.background = new THREE.Color(this.track.palette.sky);
+    this.scene.fog = new THREE.Fog(this.track.palette.fog, 16, 35);
     this._positionDesktopCamera();
     this.place();
     this.renderer.setAnimationLoop(() => this.render());
@@ -1734,18 +3060,25 @@ class Game {
   _positionDesktopCamera() {
     if (!this.desktopMode) return;
     if (innerWidth / innerHeight < 0.72) {
-      this.camera.fov = 58;
-      this.camera.position.set(9.2, 9.8, 12.4);
+      this.baseCameraFov = 54;
+      this.cameraOffset.set(8.4, 9.2, 11);
     } else {
-      this.camera.fov = 44;
-      this.camera.position.set(6.4, 6, 7.6);
+      this.baseCameraFov = 44;
+      this.cameraOffset.set(7.8, 7.1, 9.2);
     }
+    this.camera.fov = this.baseCameraFov;
+    this.cameraTarget.set(
+      this.localCar?.group.position.x || 0,
+      0.14,
+      this.localCar?.group.position.z || 0
+    );
+    this.camera.position.copy(this.cameraTarget).add(this.cameraOffset);
     this.camera.updateProjectionMatrix();
     this.camera.lookAt(this.cameraTarget);
   }
 
   async startWebXR() {
-    this.gameRoot.scale.setScalar(0.48);
+    this.gameRoot.scale.setScalar(XR_WORLD_SCALE);
     if (typeof this.renderer.xr.setFramebufferScaleFactor === 'function') {
       this.renderer.xr.setFramebufferScaleFactor(this.isQuest ? 0.85 : 1);
     }
@@ -1755,6 +3088,7 @@ class Game {
       document.getElementById('overlay')
     );
     this.xrSession = session;
+    this.hitTestSource = hitTestSource;
     if (typeof this.renderer.xr.setFoveation === 'function') {
       this.renderer.xr.setFoveation(this.isQuest ? 0.65 : 0);
     }
@@ -1764,13 +3098,17 @@ class Game {
     this.canvas.addEventListener('click', this._placementHandler);
     session.addEventListener('select', this._placementHandler);
     if (!hitTestSource) {
-      this.gameRoot.position.set(0, 0, -2.3);
+      this.gameRoot.position.set(0, 0, -2.7);
       this.place();
     }
     session.addEventListener('end', () => {
-      if (hitTestSource) hitTestSource.cancel();
+      if (this.hitTestSource) this.hitTestSource.cancel();
+      this.hitTestSource = null;
+      this.xrSession = null;
       window.XRRC_XR_INPUT = null;
-      if (game === this) restoreLobby(I18n.t('status.sessionEnded'));
+      if (!this.destroyed && game === this) {
+        restoreLobby(I18n.t('status.sessionEnded'));
+      }
     });
     this.renderer.setAnimationLoop((time, frame) => {
       window.XRRC_XR_INPUT = ControlsCore.readXRInputSources(session.inputSources);
@@ -1788,17 +3126,90 @@ class Game {
   }
 
   update() {
-    const delta = Math.min(this.clock.getDelta(), 0.05);
+    const frameDelta = Math.min(this.clock.getDelta(), MAX_FRAME_CATCHUP);
+    if (this.paused) {
+      audioManager.update({ speed: 0, throttle: 0, steering: 0 });
+      return;
+    }
+    let remaining = frameDelta;
+    while (remaining > 0.000001) {
+      const delta = Math.min(remaining, MAX_SIMULATION_STEP);
+      this._step(delta);
+      remaining -= delta;
+    }
+  }
+
+  _step(delta) {
+    if (this.raceState.status === 'racing') {
+      this.raceState.elapsedMs += delta * 1000;
+      this.raceState.lapElapsedMs += delta * 1000;
+      this.ghostSampleTimer += delta;
+    }
+    this.boostTimer = Math.max(0, this.boostTimer - delta);
     let telemetry = null;
+    const preSurface = this._sampleSurface(this.localCar.group.position);
+    this._applySteeringAssist(preSurface);
+    const rampZone = JUMP_ZONES.find((zone) => (
+      Math.hypot(
+        this.localCar.group.position.x - zone.x,
+        this.localCar.group.position.z - zone.z
+      ) <= zone.radius * 0.45
+    ));
+    const rampLaunchSpeed = (
+      this.props.jump &&
+      this.localCar.spec.category === 'ground' &&
+      preSurface.type === 'stunt' &&
+      rampZone
+    )
+      ? Core.getRampLaunchSpeed(
+          this.localCar.group.position,
+          this.localCar.velocity,
+          JUMP_ZONES
+        )
+      : 0;
+    const loopTrigger = (
+      this.props.loop &&
+      this.localCar.spec.category === 'ground' &&
+      !this.localCar.airborne &&
+      this.localCar.loopCooldown <= 0 &&
+      Math.abs(this.localCar.velocity) > 1.05 &&
+      Math.abs(this.localCar.group.position.x - STUNT_LOOP.centerX) < 0.24 &&
+      Math.abs(this.localCar.group.position.z - STUNT_LOOP.centerZ) < 0.22
+    );
+    this.localCar.networkRaceState = this._serializeRaceState();
     for (const car of this.worldCars.values()) {
-      const result = car.update(delta);
+      const result = car.update(delta, car === this.localCar
+        ? {
+            boost: this.boostTimer > 0,
+            loop: this.localCar.loopState || loopTrigger ? STUNT_LOOP : null,
+            loopTrigger,
+            rampLaunchSpeed,
+            surface: preSurface,
+          }
+        : {});
       if (car === this.localCar) telemetry = result;
     }
     for (const car of remoteCars.values()) car.update(delta);
+    this._updateAIRacers(delta);
+    this._updateGhost();
+    if (!telemetry) return;
+
+    const boundaryCollision = telemetry.collided;
+    this._resolveStaticCollisions(telemetry);
     this._resolveVehicleCollisions();
     this.particles.update(delta);
+    this.skidMarks.update(delta);
     this.collisionCooldown = Math.max(0, this.collisionCooldown - delta);
-    if (!telemetry) return;
+    telemetry.surface = this._sampleSurface(this.localCar.group.position);
+    if (this._handleRecovery(telemetry, delta, boundaryCollision)) {
+      telemetry.velocity = 0;
+      telemetry.collided = false;
+      telemetry.airborne = this.localCar.airborne;
+      telemetry.surface = this._sampleSurface(this.localCar.group.position);
+    }
+    this._updateRaceProgress(telemetry.surface, telemetry);
+    this._recordGhostSample();
+    this._updateBoost(telemetry, delta);
 
     audioManager.update({
       speed: telemetry.velocity,
@@ -1812,18 +3223,518 @@ class Game {
       document.getElementById('speed-value').textContent = String(
         Core.speedToKph(telemetry.velocity)
       ).padStart(2, '0');
+      this._syncRaceTimingHud();
+      this._syncStandings();
     }
 
-    if (this.desktopMode && !this.reducedMotion) {
-      this.cameraTarget.lerp(
-        new THREE.Vector3(
-          this.localCar.group.position.x * 0.18,
-          0.15,
-          this.localCar.group.position.z * 0.12
-        ),
-        0.04
+    if (this.desktopMode) {
+      const cameraGoal = new THREE.Vector3(
+        this.localCar.group.position.x,
+        0.14 + this.localCar.group.position.y * 0.18,
+        this.localCar.group.position.z
       );
+      const blend = this.reducedMotion ? 1 : 1 - Math.exp(-4.6 * delta);
+      this.cameraTarget.lerp(cameraGoal, blend);
+      this.camera.position.copy(this.cameraTarget).add(this.cameraOffset);
       this.camera.lookAt(this.cameraTarget);
+      const speedFov = Math.min(4.5, Math.abs(telemetry.velocity) * 2.2);
+      const targetFov = this.baseCameraFov + speedFov + (this.boostTimer > 0 ? 6 : 0);
+      const nextFov = THREE.MathUtils.lerp(this.camera.fov, targetFov, blend);
+      if (Math.abs(nextFov - this.camera.fov) > 0.01) {
+        this.camera.fov = nextFov;
+        this.camera.updateProjectionMatrix();
+      }
+    }
+  }
+
+  _applySteeringAssist(surface) {
+    const car = this.localCar;
+    if (
+      !this.assistEnabled ||
+      !car.active ||
+      car.spec.category !== 'ground' ||
+      surface.type !== 'road' ||
+      car.velocity < 0.12 ||
+      Math.abs(car.steering) > 0.82
+    ) {
+      return;
+    }
+    const forwardX = surface.tangent.x * this.raceDirection;
+    const forwardZ = surface.tangent.z * this.raceDirection;
+    const targetHeading = Math.atan2(-forwardX, -forwardZ);
+    const correction = -wrappedAngleDelta(targetHeading, car.group.rotation.y) * 0.24;
+    car.steering = Core.clamp(car.steering + correction, -1, 1);
+  }
+
+  _updateBoost(telemetry, delta) {
+    const meter = document.getElementById('boost-meter');
+    const drifting = (
+      this.raceState.status === 'racing' &&
+      this.localCar.spec.category === 'ground' &&
+      !telemetry.airborne &&
+      telemetry.surface.type !== 'offroad' &&
+      telemetry.drifting
+    );
+    if (drifting) {
+      this.boostCharge = Math.min(
+        1,
+        this.boostCharge + delta * (0.3 + telemetry.speedRatio * 0.2)
+      );
+      this.skidTimer -= delta;
+      if (this.skidTimer <= 0) {
+        this.skidTimer = 0.055;
+        this.skidMarks.add(this.localCar);
+      }
+    } else if (this.wasDrifting && this.boostCharge >= 0.2) {
+      this.boostTimer = 0.28 + this.boostCharge * 1.1;
+      this.boostCharge = 0;
+      audioManager.playCue('boost');
+      document.dispatchEvent(new CustomEvent('car-boost'));
+      this.particles.burst(
+        this.localCar.pointFromLocal(0, 0.08, 0.22),
+        [0xf1c644, 0x5fae7e, 0xf4ead2],
+        18,
+        0.48
+      );
+    } else if (this.boostTimer <= 0) {
+      this.boostCharge = Math.max(0, this.boostCharge - delta * 0.025);
+    }
+    this.wasDrifting = drifting;
+    meter.style.setProperty('--boost-charge', `${this.boostCharge * 100}%`);
+    meter.setAttribute('aria-valuenow', String(Math.round(this.boostCharge * 100)));
+    meter.dataset.active = String(this.boostTimer > 0);
+  }
+
+  _resetRaceState() {
+    this.raceAttempt = Math.max(Date.now(), (this.raceAttempt || 0) + 1);
+    this.raceState = {
+      attempt: this.raceAttempt,
+      completedLaps: 0,
+      currentSectorTimes: [],
+      elapsedMs: 0,
+      finishTime: null,
+      finished: false,
+      lap: 1,
+      lapElapsedMs: 0,
+      lapTimes: [],
+      lastProgress: 0,
+      nextCheckpoint: 0,
+      personalBest: false,
+      progress: 0,
+      revision: 0,
+      sectorStartedAt: 0,
+      started: false,
+      status: 'countdown',
+      wasOnRoad: true,
+      wrongWay: false,
+    };
+    this.ghostSamples = [];
+    this.localCar.networkRaceState = this._serializeRaceState();
+    this._syncRaceHud('road');
+    this._syncRaceTimingHud();
+    this._syncStandings();
+  }
+
+  _normalizedProgress(progress) {
+    const delta = this.raceDirection > 0
+      ? progress - this.startProgress
+      : this.startProgress - progress;
+    return (delta + 1) % 1;
+  }
+
+  _updateRaceProgress(surface, telemetry) {
+    const race = this.raceState;
+    const progress = this._normalizedProgress(surface.progress);
+    const tangentX = surface.tangent.x * this.raceDirection;
+    const tangentZ = surface.tangent.z * this.raceDirection;
+    const velocityDirection = Math.sign(telemetry.velocity || 1);
+    const travelX = -Math.sin(this.localCar.group.rotation.y) * velocityDirection;
+    const travelZ = -Math.cos(this.localCar.group.rotation.y) * velocityDirection;
+    const alignment = travelX * tangentX + travelZ * tangentZ;
+    race.wrongWay = (
+      surface.type === 'road' &&
+      Math.abs(telemetry.velocity) > 0.16 &&
+      alignment < -0.28
+    );
+
+    if (surface.type !== 'road' || race.wrongWay) {
+      race.nextCheckpoint = 0;
+      race.started = false;
+      race.wasOnRoad = false;
+      race.currentSectorTimes = [];
+      race.sectorStartedAt = 0;
+      this._syncRaceHud(surface.type);
+      return;
+    }
+
+    if (!race.wasOnRoad) {
+      race.lastProgress = progress;
+      race.progress = progress;
+      race.wasOnRoad = true;
+      this._syncRaceHud(surface.type);
+      return;
+    }
+
+    const forwardDelta = (progress - race.lastProgress + 1) % 1;
+    const isContinuous = forwardDelta <= 0.08;
+    if (isContinuous && race.status === 'racing') {
+      const nextThreshold = RACE_CHECKPOINTS[race.nextCheckpoint];
+      if (
+        nextThreshold !== undefined &&
+        race.lastProgress < nextThreshold &&
+        progress >= nextThreshold
+      ) {
+        this._completeSector(race.nextCheckpoint);
+        race.nextCheckpoint += 1;
+        race.started = true;
+      }
+      if (
+        race.nextCheckpoint === RACE_CHECKPOINTS.length &&
+        race.lastProgress > 0.82 &&
+        progress < 0.18
+      ) {
+        this._completeLap();
+      }
+    }
+    race.lastProgress = progress;
+    race.progress = progress;
+    this._syncRaceHud(surface.type);
+  }
+
+  _completeSector(index) {
+    const race = this.raceState;
+    const time = Math.max(1, race.lapElapsedMs - race.sectorStartedAt);
+    race.currentSectorTimes[index] = time;
+    race.sectorStartedAt = race.lapElapsedMs;
+    audioManager.playCue('sector');
+    showToast(I18n.t('race.sectorComplete', {
+      sector: index + 1,
+      time: RaceCore.formatTime(time),
+    }));
+    this._broadcastRace();
+  }
+
+  _completeLap() {
+    const race = this.raceState;
+    this._recordGhostSample(true);
+    const finalSector = Math.max(1, race.lapElapsedMs - race.sectorStartedAt);
+    race.currentSectorTimes[RACE_CHECKPOINTS.length] = finalSector;
+    const completedLap = race.lap;
+    const lapTime = Math.max(1, race.lapElapsedMs);
+    race.lapTimes.push(lapTime);
+    race.completedLaps += 1;
+
+    const recorded = RaceCore.recordLap(
+      this.raceSave,
+      this.track.id,
+      lapTime,
+      race.currentSectorTimes,
+      {
+        samples: this.ghostSamples,
+        vehicle: this.localCar.type,
+      }
+    );
+    this.raceSave = recorded.save;
+    persistRaceSave(this.raceSave);
+    if (recorded.isPersonalBest) {
+      race.personalBest = true;
+      const ghost = this.raceSave.ghosts[this.track.id];
+      if (ghost) this._replaceGhost(ghost);
+      showToast(I18n.t('race.newBest', { time: RaceCore.formatTime(lapTime) }));
+    } else {
+      showToast(I18n.t('race.lapComplete', { lap: completedLap }));
+    }
+    this._syncBestLapHud();
+
+    if (race.completedLaps >= this.totalLaps) {
+      this._finishRace();
+      return;
+    }
+    race.lap += 1;
+    race.lapElapsedMs = 0;
+    race.nextCheckpoint = 0;
+    race.started = false;
+    race.sectorStartedAt = 0;
+    race.currentSectorTimes = [];
+    this.ghostSamples = [];
+    this.ghostSampleTimer = 0;
+    this._recordGhostSample(true);
+    this._broadcastRace();
+  }
+
+  _finishRace() {
+    const race = this.raceState;
+    race.finished = true;
+    race.finishTime = race.elapsedMs;
+    race.status = 'finished';
+    race.progress = 0;
+    this.setActive(false);
+    audioManager.playCue('finish');
+    this._broadcastRace();
+    const standings = this._syncStandings();
+    const local = standings.find(({ id }) => id === 'local');
+    showToast(I18n.t('race.finished', { position: local?.position || 1 }));
+    window.setTimeout(() => {
+      if (game === this && this.raceState.finished) this._showResults();
+    }, 650);
+  }
+
+  _showResults() {
+    const standings = this._syncStandings();
+    const local = standings.find(({ id }) => id === 'local');
+    document.getElementById('results-position').textContent =
+      `P${local?.position || 1} / ${standings.length}`;
+    document.getElementById('results-time').textContent =
+      RaceCore.formatTime(this.raceState.finishTime);
+    document.getElementById('results-record').textContent = I18n.t(
+      this.raceState.personalBest ? 'results.record' : 'results.complete'
+    );
+    const body = document.getElementById('results-laps');
+    body.replaceChildren(...this.raceState.lapTimes.map((time, index) => {
+      const row = document.createElement('tr');
+      const lap = document.createElement('td');
+      const value = document.createElement('td');
+      lap.textContent = String(index + 1);
+      value.textContent = RaceCore.formatTime(time);
+      row.append(lap, value);
+      return row;
+    }));
+    const dialog = document.getElementById('results-dialog');
+    if (!dialog.open) dialog.showModal();
+  }
+
+  _syncBestLapHud() {
+    const best = Number(this.raceSave.bestLaps[this.track.id]);
+    document.getElementById('best-lap-time').textContent = RaceCore.formatTime(best);
+  }
+
+  _syncRaceTimingHud() {
+    const race = this.raceState;
+    const value = race.status === 'finished' ? race.finishTime : race.elapsedMs;
+    document.getElementById('race-time').textContent = RaceCore.formatTime(value, '0:00.000');
+  }
+
+  _collectStandings() {
+    const race = this.raceState;
+    const racers = [{
+      completedLaps: race.completedLaps,
+      finishTime: race.finishTime,
+      finished: race.finished,
+      id: 'local',
+      local: true,
+      name: I18n.t('race.you'),
+      progress: race.progress,
+    }];
+    for (const ai of this.aiRacers) {
+      racers.push({
+        completedLaps: ai.completedLaps,
+        finishTime: ai.finishTime,
+        finished: ai.finished,
+        id: ai.id,
+        name: ai.name,
+        progress: ai.progress,
+      });
+    }
+    let remoteIndex = 1;
+    for (const [id, car] of remoteCars) {
+      const remoteRace = car.raceState;
+      const surface = this._sampleSurface(car.group.position);
+      racers.push({
+        completedLaps: remoteRace?.completedLaps || 0,
+        finishTime: remoteRace?.finishTime || null,
+        finished: Boolean(remoteRace?.finished),
+        id,
+        name: `${I18n.t('race.rival')} ${remoteIndex}`,
+        progress: remoteRace?.progress ?? this._normalizedProgress(surface.progress),
+      });
+      remoteIndex += 1;
+    }
+    return RaceCore.rankRacers(racers);
+  }
+
+  _syncStandings() {
+    const standings = this._collectStandings();
+    this.standings = standings;
+    const list = document.getElementById('standings-list');
+    list.replaceChildren(...standings.map((racer) => {
+      const item = document.createElement('li');
+      item.dataset.local = String(Boolean(racer.local));
+      const position = document.createElement('span');
+      const name = document.createElement('span');
+      const lap = document.createElement('span');
+      position.textContent = `P${racer.position}`;
+      name.textContent = racer.name;
+      lap.textContent = racer.finished
+        ? I18n.t('race.done')
+        : `${Math.min(this.totalLaps, racer.completedLaps + 1)}/${this.totalLaps}`;
+      item.append(position, name, lap);
+      return item;
+    }));
+    const local = standings.find(({ id }) => id === 'local');
+    document.getElementById('position-label').textContent =
+      `P${local?.position || 1} / ${standings.length}`;
+    return standings;
+  }
+
+  _syncRaceHud(surfaceType) {
+    const guide = document.getElementById('race-guide');
+    const lap = document.getElementById('lap-label');
+    const sector = document.getElementById('sector-label');
+    const status = document.getElementById('route-status');
+    const progress = document.getElementById('race-progress-bar');
+    if (!guide || !lap || !sector || !status || !progress) return;
+    const race = this.raceState;
+    const sectorNumber = Math.min(4, race.nextCheckpoint + 1);
+    let state = surfaceType;
+    let statusKey = surfaceType === 'offroad' ? 'race.offCourse' : 'race.onCourse';
+    if (surfaceType === 'stunt') statusKey = 'race.stuntLane';
+    if (race.wrongWay) {
+      state = 'wrong-way';
+      statusKey = 'race.wrongWay';
+    } else if (this.localCar?.airborne) {
+      state = 'airborne';
+      statusKey = 'race.airborne';
+    }
+    guide.dataset.state = state;
+    lap.textContent = I18n.t('race.lap', {
+      lap: Math.min(this.totalLaps, race.lap),
+      total: this.totalLaps,
+    });
+    sector.textContent = I18n.t('race.sector', { sector: sectorNumber });
+    status.textContent = I18n.t(statusKey);
+    progress.setAttribute('aria-valuenow', String(Math.round(race.progress * 100)));
+    progress.style.setProperty('--race-progress', `${race.progress * 100}%`);
+  }
+
+  _handleRecovery(telemetry, delta, boundaryCollision) {
+    const position = this.localCar.group.position;
+    const finitePosition = [position.x, position.y, position.z].every(Number.isFinite);
+    if (!finitePosition || boundaryCollision) {
+      this._recoverVehicle();
+      return true;
+    }
+
+    const surface = telemetry.surface;
+    if (
+      surface.type === 'road' &&
+      !telemetry.airborne &&
+      !telemetry.staticCollision &&
+      surface.roadDistance < this.roadWidth * 0.4
+    ) {
+      this._saveRecoveryPose(surface);
+    }
+
+    const pushingWhileStuck = (
+      this.localCar.active &&
+      Math.abs(telemetry.throttle) > 0.62 &&
+      Math.abs(telemetry.velocity) < 0.045 &&
+      !telemetry.airborne &&
+      (surface.type === 'offroad' || telemetry.staticCollision)
+    );
+    this.stuckTimer = pushingWhileStuck ? this.stuckTimer + delta : 0;
+    if (this.stuckTimer < 1.35) return false;
+    this._recoverVehicle();
+    return true;
+  }
+
+  _isRecoveryPoseClear(pose) {
+    const car = this.localCar;
+    const candidate = {
+      hx: car.halfExtents.x,
+      hz: car.halfExtents.z,
+      theta: pose.heading,
+      x: pose.x,
+      z: pose.z,
+    };
+    return this.staticColliders.every((collider) => {
+      if (!Core.verticalRangesOverlap(
+        car.spec.rideHeight,
+        car.halfExtents,
+        0,
+        { minY: 0, maxY: collider.height }
+      )) {
+        return true;
+      }
+      return !testOBBCollision(candidate, collider);
+    });
+  }
+
+  _saveRecoveryPose(surface) {
+    const tangentX = surface.tangent.x * this.raceDirection;
+    const tangentZ = surface.tangent.z * this.raceDirection;
+    const alignedHeading = Math.atan2(-tangentX, -tangentZ);
+    const current = this.localCar.group.position;
+    const candidates = [
+      {
+        heading: alignedHeading,
+        x: surface.nearest.x,
+        y: this.localCar.spec.rideHeight,
+        z: surface.nearest.z,
+      },
+      {
+        heading: alignedHeading,
+        x: current.x,
+        y: this.localCar.spec.rideHeight,
+        z: current.z,
+      },
+      {
+        heading: this.localCar.group.rotation.y,
+        x: current.x,
+        y: this.localCar.spec.rideHeight,
+        z: current.z,
+      },
+    ];
+    const safePose = candidates.find((candidate) => this._isRecoveryPoseClear(candidate));
+    if (safePose) this.lastSafePose = safePose;
+  }
+
+  _recoverVehicle() {
+    const pose = this.lastSafePose || { ...START_GRID, y: this.localCar.spec.rideHeight };
+    this.localCar.reset(
+      pose.x,
+      pose.z,
+      pose.heading,
+      this.localCar.spec.rideHeight
+    );
+    this.stuckTimer = 0;
+    showToast(I18n.t('race.recovered'));
+    this.particles.burst(
+      this.localCar.group.position.clone(),
+      [0xf1c644, 0xe84a27, 0xf4ead2],
+      12,
+      0.3
+    );
+  }
+
+  _resolveStaticCollisions(telemetry) {
+    const car = this.localCar;
+    if (!car?.halfExtents) return;
+    for (const collider of this.staticColliders) {
+      if (!Core.verticalRangesOverlap(
+        car.group.position.y,
+        car.halfExtents,
+        0,
+        { minY: 0, maxY: collider.height }
+      )) {
+        continue;
+      }
+      const hit = testOBBCollision(vehicleOBB(car), collider);
+      if (!hit) continue;
+      const impact = Math.abs(car.velocity);
+      car.group.position.x -= hit.normal.x * (hit.overlap + 0.008);
+      car.group.position.z -= hit.normal.z * (hit.overlap + 0.008);
+      clampToBounds(car.group.position);
+      car.velocity *= -Math.max(0.08, car.spec.physics.collisionBounce || 0.16);
+      addKnockback(car, -hit.normal.x, -hit.normal.z, Math.min(0.55, impact * 0.32));
+      telemetry.collided = true;
+      telemetry.staticCollision = collider.label;
+      this.lastStaticCollision = {
+        impact,
+        label: collider.label,
+        timestamp: performance.now(),
+      };
+      telemetry.impact = Math.max(telemetry.impact || 0, impact);
+      if (impact > 0.2) this._triggerImpactFx(car.group.position, impact);
     }
   }
 
@@ -1832,6 +3743,22 @@ class Game {
     const isGroundVehicle = this.localCar.spec.category === 'ground';
     this.dustTimer -= delta;
     this.smokeTimer -= delta;
+    this.boostFxTimer -= delta;
+
+    if (this.boostTimer > 0 && this.boostFxTimer <= 0) {
+      this.boostFxTimer = 0.035;
+      this.particles.spawn(
+        this.localCar.pointFromLocal((Math.random() - 0.5) * 0.12, 0.07, 0.23),
+        new THREE.Vector3(
+          (Math.random() - 0.5) * 0.08,
+          0.02 + Math.random() * 0.04,
+          (Math.random() - 0.5) * 0.08
+        ),
+        Math.random() > 0.5 ? 0xf1c644 : 0x5fae7e,
+        15 + Math.random() * 5,
+        0.4
+      );
+    }
 
     if (moving && isGroundVehicle && this.dustTimer <= 0) {
       this.dustTimer = telemetry.drifting ? 0.025 : 0.065;
@@ -1848,7 +3775,7 @@ class Game {
       this.particles.spawn(
         rear,
         velocity,
-        telemetry.drifting ? 0xc49b58 : 0xb7a070,
+        telemetry.drifting ? this.track.palette.shoulder : this.track.palette.dust,
         telemetry.drifting ? 18 : 13,
         0.55 + Math.random() * 0.35
       );
@@ -1884,7 +3811,7 @@ class Game {
           0.03 + Math.random() * 0.06,
           (Math.random() - 0.5) * 0.48
         ),
-        0xb7a070,
+        this.track.palette.dust,
         14 + Math.random() * 6,
         0.72
       );
@@ -1893,16 +3820,11 @@ class Game {
     if (telemetry.collided && telemetry.impact > 0.24) {
       this._triggerImpactFx(this.localCar.group.position, telemetry.impact);
     }
-
-    if (this.props.jump && isGroundVehicle) {
-      const jumpDistance = Math.hypot(
-        this.localCar.group.position.x - RAMP_ZONE.x,
-        this.localCar.group.position.z - RAMP_ZONE.z
+    if (telemetry.landed && telemetry.landingImpact > 0.55) {
+      this._triggerImpactFx(
+        this.localCar.group.position,
+        Math.min(1.4, telemetry.landingImpact * 0.45)
       );
-      const lift = jumpDistance < 0.4 && Math.abs(telemetry.velocity) > 0.45
-        ? Math.sin((1 - jumpDistance / 0.4) * Math.PI) * 0.14
-        : 0;
-      this.localCar.jumpLift = Math.max(this.localCar.jumpLift, lift);
     }
   }
 
@@ -1920,9 +3842,25 @@ class Game {
       if (type !== car.type) others.push(other);
     }
     others.push(...remoteCars.values());
+    const localSurface = this._sampleSurface(car.group.position);
+    if (
+      this.raceState.status === 'racing' &&
+      localSurface.type === 'road' &&
+      Math.abs(car.velocity) > 0.12
+    ) {
+      others.push(...this.aiRacers.map(({ avatar }) => avatar));
+    }
 
     for (const other of others) {
       if (!other.halfExtents) continue;
+      if (!Core.verticalRangesOverlap(
+        car.group.position.y,
+        car.halfExtents,
+        other.group.position.y,
+        other.halfExtents
+      )) {
+        continue;
+      }
       const hit = testOBBCollision(vehicleOBB(car), vehicleOBB(other));
       if (!hit) continue;
 
@@ -1976,16 +3914,43 @@ class Game {
   }
 
   destroy() {
+    if (this.destroyed) return;
+    this.destroyed = true;
     this.thumbnailGeneration += 1;
     cancelBackgroundTask(this.thumbnailTask);
     this.thumbnailTask = null;
     window.removeEventListener('resize', this._resizeHandler);
+    document.removeEventListener('game-pause', this._pauseHandler);
+    document.removeEventListener('visibilitychange', this._visibilityHandler);
     if (this._placementHandler) {
       this.canvas.removeEventListener('click', this._placementHandler);
       if (this.xrSession) this.xrSession.removeEventListener('select', this._placementHandler);
     }
+    if (this.hitTestSource) {
+      this.hitTestSource.cancel();
+      this.hitTestSource = null;
+    }
+    const xrSession = this.xrSession;
+    this.xrSession = null;
+    if (xrSession && typeof xrSession.end === 'function') {
+      xrSession.end().catch((error) => {
+        console.warn('[xr] WebXR session could not be ended:', error);
+      });
+    }
+    if (this.runtime && window.XR8 && typeof window.XR8.stop === 'function') {
+      Promise.resolve(window.XR8.stop()).catch((error) => {
+        console.warn('[xr] 8th Wall runtime could not be stopped:', error);
+      });
+    }
     window.XRRC_XR_INPUT = null;
     if (this.ownsRenderer) this.renderer.setAnimationLoop(null);
+    for (const racer of this.aiRacers) racer.avatar.dispose();
+    this.aiRacers = [];
+    if (this.ghostAvatar) this.ghostAvatar.dispose();
+    this.ghostAvatar = null;
+    this.skidMarks.dispose();
+    for (const car of this.worldCars.values()) car.dispose();
+    this.worldCars.clear();
     this.scene.remove(this.gameRoot);
     this.scene.remove(this.reticle);
   }
@@ -2005,6 +3970,52 @@ function getSignalValue() {
 function getVehicleType() {
   const selected = document.querySelector('input[name="vehicle"]:checked');
   return normalizeVehicleSelection(selected ? selected.value : 'rally');
+}
+
+function syncVehicleProfile() {
+  const type = getVehicleType();
+  const spec = Core.getVehicleSpec(type);
+  document.getElementById('vehicle-role').textContent = I18n.t(`vehicle.${type}Role`);
+  document.getElementById('vehicle-note').textContent = I18n.t(`vehicle.${type}Note`);
+  for (const [rating, value] of Object.entries(spec.ratings)) {
+    const meter = document.getElementById(`vehicle-rating-${rating}`);
+    meter.style.setProperty('--rating', value);
+    meter.setAttribute('aria-valuenow', String(value));
+    meter.setAttribute(
+      'aria-label',
+      `${I18n.t(`vehicle.${rating}`)}: ${value} / 5`
+    );
+  }
+}
+
+function getTrackId() {
+  const selected = document.querySelector('input[name="track"]:checked');
+  return TrackCore.normalizeTrackId(selected ? selected.value : TrackCore.DEFAULT_TRACK);
+}
+
+function syncTrackPresentation(value, updateUrl = false) {
+  const trackId = TrackCore.normalizeTrackId(value);
+  const input = document.querySelector(`input[name="track"][value="${trackId}"]`);
+  if (input) input.checked = true;
+  document.documentElement.dataset.track = trackId;
+  const caption = document.querySelector('#garage-caption strong');
+  if (caption) caption.textContent = I18n.t(`track.${trackId}`);
+
+  if (updateUrl) {
+    const url = new URL(location.href);
+    url.searchParams.set('track', trackId);
+    history.replaceState(null, '', url);
+  }
+  return trackId;
+}
+
+function setupTrackPicker(requestedTrack) {
+  syncTrackPresentation(requestedTrack, false);
+  document.querySelectorAll('input[name="track"]').forEach((input) => {
+    input.addEventListener('change', () => {
+      if (input.checked) syncTrackPresentation(input.value, true);
+    });
+  });
 }
 
 function setSignalStatus(state, message, summary) {
@@ -2066,13 +4077,18 @@ async function checkBackend() {
   }
 }
 
-function startNetwork(room, signalValue) {
+function startNetwork(room, signalValue, trackId) {
   if (!signalValue) {
     setNetworkStatus('solo', I18n.t('race.solo'));
     return;
   }
 
-  const signalingUrl = Config.buildSignalUrl(signalValue, room, location.protocol);
+  const signalingUrl = Config.buildSignalUrl(
+    signalValue,
+    room,
+    location.protocol,
+    trackId
+  );
   networkManager = new window.NetworkManager();
   networkManager.addEventListener('status', ({ detail }) => {
     const translated = {
@@ -2089,16 +4105,32 @@ function startNetwork(room, signalValue) {
     remoteCars.set(detail.id, car);
     document.getElementById('peer-count').textContent = remoteCars.size + 1;
     showToast(I18n.t('race.joined'));
+    game._broadcastRace();
   });
   networkManager.addEventListener('peer-leave', ({ detail }) => {
     const car = remoteCars.get(detail.id);
-    if (car && game) game.gameRoot.remove(car.group);
+    if (car) car.dispose();
     remoteCars.delete(detail.id);
     document.getElementById('peer-count').textContent = remoteCars.size + 1;
   });
   networkManager.addEventListener('peer-state', ({ detail }) => {
     const car = remoteCars.get(detail.id);
-    if (car) car.applyRemoteState(detail.state);
+    if (car) {
+      car.applyRemoteState(detail.state);
+      if (!networkManager.isHost && detail.id === networkManager.hostId) {
+        game.adoptRaceRules(detail.state.race);
+      }
+    }
+  });
+  networkManager.addEventListener('peer-race', ({ detail }) => {
+    const car = remoteCars.get(detail.id);
+    if (car) car.applyRaceState(detail.race);
+    if (!networkManager.isHost && detail.id === networkManager.hostId) {
+      game.adoptRaceRules(detail.race);
+    }
+  });
+  networkManager.addEventListener('host-change', ({ detail }) => {
+    if (detail.isHost && game) game._broadcastRace();
   });
   networkManager.connect(signalingUrl);
 }
@@ -2179,22 +4211,26 @@ async function renderShareQrCode(shareUrl) {
   }
 }
 
-function setupShareLink(room, signalValue) {
+function setupShareLink(room, signalValue, trackId) {
   const button = document.getElementById('share-link');
   const dialog = document.getElementById('share-dialog');
   const closeButton = document.getElementById('share-close');
   const copyButton = document.getElementById('share-copy');
   const nativeButton = document.getElementById('share-native');
   const shareInput = document.getElementById('share-url');
-  const shareUrl = Config.buildShareUrl(location.href, room, signalValue);
+  const shareUrl = Config.buildShareUrl(location.href, room, signalValue, trackId);
   const shareData = {
     title: I18n.t('race.roomTitle', { room }),
-    text: I18n.t('race.roomInvite'),
+    text: I18n.t('race.roomInvite', { track: I18n.t(`track.${trackId}`) }),
     url: shareUrl,
   };
+  const shareLocation = new URL(shareUrl);
+  shareLocation.searchParams.set('laps', String(game?.totalLaps || 3));
+  const configuredShareUrl = shareLocation.toString();
+  shareData.url = configuredShareUrl;
   const targets = ShareCore.buildShareTargets(shareData);
 
-  shareInput.value = shareUrl;
+  shareInput.value = configuredShareUrl;
   shareInput.onfocus = () => shareInput.select();
   document.getElementById('share-room-code').textContent = `#${room.toUpperCase()}`;
   document.getElementById('share-email').href = targets.email;
@@ -2212,7 +4248,7 @@ function setupShareLink(room, signalValue) {
 
   copyButton.onclick = async () => {
     try {
-      await copyText(shareUrl);
+      await copyText(configuredShareUrl);
       copyButton.dataset.state = 'success';
       copyButton.textContent = I18n.t('share.copied');
       audioManager.playCue('copy');
@@ -2234,7 +4270,7 @@ function setupShareLink(room, signalValue) {
     resetShareCopyButton();
     if (!dialog.open) dialog.showModal();
     const qrCanvas = document.getElementById('share-qr');
-    if (qrCanvas.dataset.shareUrl !== shareUrl) renderShareQrCode(shareUrl);
+    if (qrCanvas.dataset.shareUrl !== configuredShareUrl) renderShareQrCode(configuredShareUrl);
   };
 }
 
@@ -2257,8 +4293,13 @@ function enterGame(runtime = null) {
     Config.normalizeSignalUrl(signalValue, location.protocol);
   }
   const props = {
+    aiCount: document.getElementById('ai-count').value,
+    assist: document.getElementById('steering-assist').checked,
     jump: document.getElementById('prop-jump').checked,
+    laps: document.getElementById('lap-count').value,
     loop: document.getElementById('prop-loop').checked,
+    multiplayer: Boolean(signalValue),
+    track: getTrackId(),
     traffic: document.getElementById('prop-traffic').checked,
   };
 
@@ -2273,6 +4314,88 @@ function enterGame(runtime = null) {
     runtime
   );
   window.XRRC_DIAGNOSTICS = Object.freeze({
+    recover() {
+      game._recoverVehicle();
+    },
+    summonVehicle(type) {
+      return game._summonVehicle(type);
+    },
+    setWorldVehicleState(type, state) {
+      const car = game.worldCars.get(normalizeVehicleSelection(type));
+      if (!car || !state || typeof state !== 'object') {
+        throw new TypeError('setWorldVehicleState requires an existing vehicle and state');
+      }
+      for (const key of ['x', 'y', 'z', 'heading', 'velocity', 'verticalVelocity']) {
+        if (state[key] !== undefined && !Number.isFinite(state[key])) {
+          throw new TypeError(`${key} must be finite`);
+        }
+      }
+      car.reset(
+        state.x ?? car.group.position.x,
+        state.z ?? car.group.position.z,
+        state.heading ?? car.group.rotation.y,
+        state.y ?? car.group.position.y
+      );
+      car.velocity = state.velocity ?? 0;
+      car.verticalVelocity = state.verticalVelocity ?? 0;
+    },
+    sampleSurface(position) {
+      if (!position || !Number.isFinite(position.x) || !Number.isFinite(position.z)) {
+        throw new TypeError('sampleSurface requires finite x and z coordinates');
+      }
+      return game._sampleSurface(position);
+    },
+    setCourseProgress(progress, state = {}) {
+      if (!Number.isFinite(progress) || progress < 0 || progress >= 1) {
+        throw new RangeError('setCourseProgress requires progress in [0, 1)');
+      }
+      const rawProgress = (
+        game.startProgress +
+        game.raceDirection * progress +
+        1
+      ) % 1;
+      const point = game.trackCurve.getPointAt(rawProgress).multiplyScalar(COURSE_SCALE);
+      const tangent = game.trackCurve.getTangentAt(rawProgress).normalize();
+      const forwardX = tangent.x * game.raceDirection;
+      const forwardZ = tangent.z * game.raceDirection;
+      const car = game.localCar;
+      car.group.position.set(
+        point.x,
+        state.y ?? car.spec.rideHeight,
+        point.z
+      );
+      car.group.rotation.y = Math.atan2(-forwardX, -forwardZ);
+      car.velocity = state.velocity ?? 0;
+      car.verticalVelocity = state.verticalVelocity ?? 0;
+      car.airborne = car.group.position.y >
+        (car.spec.groundHeight ?? car.spec.rideHeight) + 0.01;
+      car.rampContact = false;
+    },
+    setLocalVehicleState(state) {
+      if (!state || typeof state !== 'object') {
+        throw new TypeError('setLocalVehicleState requires a state object');
+      }
+      for (const key of ['x', 'y', 'z', 'heading', 'velocity', 'verticalVelocity']) {
+        if (state[key] !== undefined && !Number.isFinite(state[key])) {
+          throw new TypeError(`${key} must be finite`);
+        }
+      }
+      const car = game.localCar;
+      car.group.position.set(
+        state.x ?? car.group.position.x,
+        state.y ?? car.group.position.y,
+        state.z ?? car.group.position.z
+      );
+      car.group.rotation.y = state.heading ?? car.group.rotation.y;
+      car.velocity = state.velocity ?? car.velocity;
+      car.verticalVelocity = state.verticalVelocity ?? car.verticalVelocity;
+      car.knockback.x = 0;
+      car.knockback.z = 0;
+      car.peakY = car.group.position.y;
+      car.airborne = car.group.position.y >
+        (car.spec.groundHeight ?? car.spec.rideHeight) + 0.01;
+      car.rampContact = false;
+    },
     snapshot() {
       const render = game.renderer.info.render;
       const memory = game.renderer.info.memory;
@@ -2286,37 +4409,106 @@ function enterGame(runtime = null) {
         triangles: render.triangles,
         points: render.points,
         geometries: memory.geometries,
+        jumpCount: game.jumpMesh ? game.jumpMesh.count : 0,
+        loopRotationY: game.stuntLoop ? game.stuntLoop.rotation.y : null,
         textures: memory.textures,
         objects,
         particles: game.particles.count,
         pixelRatio: game.renderer.getPixelRatio(),
         xrScale: game.gameRoot.scale.x,
         antialias: contextAttributes ? contextAttributes.antialias : null,
+        courseScale: COURSE_SCALE,
+        inputMode: window.XRRC_INPUT_MODE || 'keyboard',
+        localVehicleSpeed: game.localCar.velocity,
+        localVehicleVerticalSpeed: game.localCar.verticalVelocity,
+        lastStaticCollision: game.lastStaticCollision
+          ? { ...game.lastStaticCollision }
+          : null,
+        race: { ...game.raceState },
+        totalLaps: game.totalLaps,
+        standings: game.standings ? game.standings.map((racer) => ({ ...racer })) : [],
+        paused: game.paused,
+        assistEnabled: game.assistEnabled,
+        boostCharge: game.boostCharge,
+        boostActive: game.boostTimer > 0,
+        network: networkManager
+          ? {
+              hostId: networkManager.hostId,
+              isHost: networkManager.isHost,
+              localId: networkManager.localId,
+              peerCount: networkManager.peerCount,
+            }
+          : null,
+        aiRacers: game.aiRacers.map((racer) => ({
+          completedLaps: racer.completedLaps,
+          finished: racer.finished,
+          name: racer.name,
+          progress: racer.progress,
+        })),
+        ghostAvailable: Boolean(game.ghostData),
+        ghostVisible: Boolean(game.ghostAvatar?.group.visible),
+        recoveryPose: { ...game.lastSafePose },
+        recoveryPoseClear: game._isRecoveryPoseClear(game.lastSafePose),
+        staticColliderCount: game.staticColliders.length,
+        staticColliders: game.staticColliders.map((collider) => ({ ...collider })),
+        surface: game._sampleSurface(game.localCar.group.position),
+        trackBounds: { ...TRACK_BOUNDS },
+        trackLength: game.trackCurve.getLength() * COURSE_SCALE,
+        startGrid: { ...START_GRID },
         quality: game.isQuest ? 'quest' : 'standard',
+        track: game.track.id,
+        trackTheme: game.track.scenery,
         localVehicle: game.localCar.type,
+        localVehiclePosition: {
+          x: game.localCar.group.position.x,
+          y: game.localCar.group.position.y,
+          z: game.localCar.group.position.z,
+        },
+        localVehiclePeakY: game.localCar.peakY,
+        localVehicleRender: game.localCar.getRenderDiagnostics(),
+        worldVehicles: Array.from(game.worldCars.keys()),
+        worldVehicleStates: Array.from(game.worldCars, ([type, car]) => ({
+          airborne: car.airborne,
+          bounds: { ...car.halfExtents },
+          position: {
+            x: car.group.position.x,
+            y: car.group.position.y,
+            z: car.group.position.z,
+          },
+          type,
+        })),
         remoteVehicles: Array.from(remoteCars.values(), (car) => car.type),
+        remoteRaceStates: Array.from(remoteCars.values(), (car) => (
+          car.raceState ? { ...car.raceState } : null
+        )),
         roadNormalY: game.road.geometry.getAttribute('normal').getY(0),
         shadows: game.renderer.shadowMap.enabled,
       };
     },
   });
-  startNetwork(room, signalValue);
-  setupShareLink(room, signalValue);
+  startNetwork(room, signalValue, props.track);
+  setupShareLink(room, signalValue, props.track);
   return game;
 }
 
 function restoreLobby(message) {
   const shareDialog = document.getElementById('share-dialog');
   if (shareDialog.open) shareDialog.close();
+  for (const id of ['pause-dialog', 'results-dialog']) {
+    const dialog = document.getElementById(id);
+    if (dialog.open) dialog.close();
+  }
   shareQrRequest += 1;
   if (networkManager) networkManager.disconnect();
   networkManager = null;
   for (const car of remoteCars.values()) {
-    if (game) game.gameRoot.remove(car.group);
+    car.dispose();
   }
   remoteCars.clear();
   if (game) game.destroy();
   game = null;
+  document.getElementById('eighthwall-btn').disabled = false;
+  syncWebXRControls();
 
   const lobby = document.getElementById('lobby');
   const hud = document.getElementById('hud');
@@ -2345,7 +4537,7 @@ async function runCountdown(activeGame) {
   }
   element.classList.remove('is-visible');
   element.textContent = '';
-  if (game === activeGame) activeGame.setActive(true);
+  if (game === activeGame) activeGame.beginRace();
 }
 
 function showToast(message) {
@@ -2395,22 +4587,25 @@ async function start8thWall() {
       }),
     ]);
     await xrReady;
-    window.XR8.addCameraPipelineModules(
-      XRCore.createEighthWallModules({
-        LandingPage: window.LandingPage,
-        XR8: window.XR8,
-        XRExtras: window.XRExtras,
-      }, {
-        onStart: () => {
-          const activeGame = enterGame(window.XR8.Threejs.xrScene());
-          activeGame.place();
-        },
-        onUpdate: () => {
-          if (game) game.update();
-        },
-      })
-    );
-    window.XR8.run({ canvas: document.getElementById('scene') });
+    if (!eighthWallConfigured) {
+      window.XR8.addCameraPipelineModules(
+        XRCore.createEighthWallModules({
+          LandingPage: window.LandingPage,
+          XR8: window.XR8,
+          XRExtras: window.XRExtras,
+        }, {
+          onStart: () => {
+            const activeGame = enterGame(window.XR8.Threejs.xrScene());
+            activeGame.place();
+          },
+          onUpdate: () => {
+            if (game) game.update();
+          },
+        })
+      );
+      eighthWallConfigured = true;
+    }
+    await window.XR8.run({ canvas: document.getElementById('scene') });
   } catch (error) {
     button.disabled = false;
     document.getElementById('lobby-status').textContent = I18n.t(
@@ -2470,6 +4665,8 @@ function syncWebXRControls() {
 function applyLanguage(language, persist = true) {
   I18n.setLanguage(language, persist);
   I18n.applyDocument(document);
+  syncTrackPresentation(getTrackId(), false);
+  syncVehicleProfile();
   syncAudioControls();
   syncWebXRControls();
   const controllerStatus = document.getElementById('controller-status');
@@ -2490,6 +4687,14 @@ function updateControllerStatus({ connected, label }) {
   showToast(controllerStatus.textContent);
 }
 
+function updateInputMode({ mode }) {
+  if (!['gamepad', 'keyboard', 'touch', 'xr'].includes(mode)) return;
+  const controllerStatus = document.getElementById('controller-status');
+  controllerStatus.dataset.state = mode;
+  controllerStatus.dataset.label = '';
+  controllerStatus.textContent = I18n.t(`controller.${mode}`);
+}
+
 async function bootstrap() {
   const params = new URLSearchParams(location.search);
   applyLanguage(
@@ -2506,23 +4711,50 @@ async function bootstrap() {
   document.addEventListener('controller-status', ({ detail }) => {
     updateControllerStatus(detail);
   });
+  document.addEventListener('input-mode', ({ detail }) => {
+    updateInputMode(detail);
+  });
   if (window.XRRC_CONTROLLER_STATUS) {
     updateControllerStatus(window.XRRC_CONTROLLER_STATUS);
   }
+  if (window.XRRC_INPUT_MODE) {
+    updateInputMode({ mode: window.XRRC_INPUT_MODE });
+  }
   const room = params.get('room');
   if (room) document.getElementById('room-input').value = Config.normalizeRoom(room);
+  document.getElementById('lap-count').value = String(
+    RaceCore.normalizeLapCount(params.get('laps'))
+  );
+  const rivals = params.get('rivals');
+  if (['0', '3', '5'].includes(rivals)) {
+    document.getElementById('ai-count').value = rivals;
+  }
+  let assistEnabled = params.get('assist') !== 'off';
+  if (!params.has('assist')) {
+    try {
+      assistEnabled = window.localStorage.getItem('xrrc-steering-assist') !== 'false';
+    } catch (error) {
+      console.warn('[race] Steering assist preference is unavailable:', error);
+    }
+  }
+  document.getElementById('steering-assist').checked = assistEnabled;
+  setupTrackPicker(params.get('track'));
   const requestedVehicle = normalizeVehicleSelection(params.get('vehicle'));
   const vehicleInput = document.querySelector(
     `input[name="vehicle"][value="${requestedVehicle}"]`
   );
   if (vehicleInput) {
     vehicleInput.checked = true;
+    syncVehicleProfile();
     requestAnimationFrame(() => {
       const rail = vehicleInput.closest('.vehicle-rail');
       const card = vehicleInput.closest('.vehicle-toggle');
       rail.scrollLeft = card.offsetLeft - (rail.clientWidth - card.clientWidth) / 2;
     });
   }
+  document.querySelectorAll('input[name="vehicle"]').forEach((input) => {
+    input.addEventListener('change', syncVehicleProfile);
+  });
   document.getElementById('signal-input').value = Config.getInitialSignalValue(
     location,
     window.XRRC_DEPLOYMENT
@@ -2552,7 +4784,8 @@ async function bootstrap() {
       restoreLobby(I18n.t('status.webxrError', { message: error.message }));
     }
   });
-  document.getElementById('desktop-btn').addEventListener('click', () => {
+  const desktopButton = document.getElementById('desktop-btn');
+  desktopButton.addEventListener('click', () => {
     try {
       enterGame().startDesktop();
     } catch (error) {
@@ -2561,9 +4794,11 @@ async function bootstrap() {
       document.getElementById('signal-input').focus();
     }
   });
+  desktopButton.disabled = false;
   const eighthWallButton = document.getElementById('eighthwall-btn');
   eighthWallButton.addEventListener('click', start8thWall);
   eighthWallButton.disabled = false;
+  document.getElementById('lobby').setAttribute('aria-busy', 'false');
 
   if (getSignalValue()) {
     document.getElementById('signal-panel').open = true;

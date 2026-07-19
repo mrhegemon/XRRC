@@ -36,6 +36,42 @@ test('keeps every share-dialog string localized', () => {
   }
 });
 
+test('keeps every course and vehicle name localized', () => {
+  const keys = Object.keys(I18n.dictionaries.en).filter((key) => (
+    key.startsWith('track.') || key.startsWith('vehicle.')
+  ));
+  for (const language of I18n.supported) {
+    for (const key of keys) {
+      assert.equal(
+        typeof I18n.dictionaries[language][key],
+        'string',
+        `${language} is missing ${key}`
+      );
+    }
+  }
+});
+
+test('keeps race, pause, results, and rule copy localized', () => {
+  const keys = Object.keys(I18n.dictionaries.en).filter((key) => (
+    key.startsWith('race.') ||
+    key.startsWith('pause.') ||
+    key.startsWith('results.') ||
+    key.startsWith('setup.race') ||
+    key.startsWith('setup.laps') ||
+    key.startsWith('setup.rivals') ||
+    key.startsWith('setup.assist')
+  ));
+  for (const language of I18n.supported) {
+    for (const key of keys) {
+      assert.equal(
+        typeof I18n.dictionaries[language][key],
+        'string',
+        `${language} is missing ${key}`
+      );
+    }
+  }
+});
+
 test('falls back to English when a localized key is missing', () => {
   I18n.setLanguage('fr', false);
   delete I18n.dictionaries.fr['race.copied'];
