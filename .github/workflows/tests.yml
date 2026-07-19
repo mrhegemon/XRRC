@@ -12,7 +12,9 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # The browser suite runs single-worker on CI (see playwright.config.js), so
+    # it trades wall-clock time for not starving parallel WebGL contexts.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v6

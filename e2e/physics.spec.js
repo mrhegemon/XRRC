@@ -225,10 +225,34 @@ test('vehicle collisions ignore vertically separated racers', async ({ page }) =
     return window.XRRC_DIAGNOSTICS.snapshot()
       .worldVehicleStates.find(({ type }) => type === 'rally');
   });
-  await page.waitForTimeout(100);
-  const separatedVertically = await page.evaluate(() => (
-    window.XRRC_DIAGNOSTICS.snapshot().localVehiclePosition
-  ));
+  // Hold the car at altitude for the duration of the check instead of letting
+  // it fall. Waiting a wall-clock window (or even a frame count) raced gravity:
+  // on a loaded machine the simulation advanced far enough for the car to land
+  // and register the very collision this test asserts cannot happen. Pinning y
+  // each frame leaves x/z free, so a knockback would still show up - it just
+  // removes the timing dependence entirely.
+  const separatedVertically = await page.evaluate(() => new Promise((resolve) => {
+    let frames = 0;
+    const tick = () => {
+      const snapshot = window.XRRC_DIAGNOSTICS.snapshot();
+      const position = snapshot.localVehiclePosition;
+      if (frames++ < 8) {
+        window.XRRC_DIAGNOSTICS.setLocalVehicleState({
+          x: position.x,
+          y: 2,
+          z: position.z,
+          velocity: 0,
+          verticalVelocity: 0,
+        });
+        requestAnimationFrame(tick);
+        return;
+      }
+      resolve({ ...position, airborne: snapshot.localVehicleRender.airborne });
+    };
+    requestAnimationFrame(tick);
+  }));
+  // The separation premise only holds while the car is still above the other.
+  expect(separatedVertically.airborne).toBe(true);
   expect(Math.hypot(
     separatedVertically.x - parked.position.x,
     separatedVertically.z - parked.position.z
@@ -361,10 +385,14 @@ test('aircraft altitude controls produce real vertical movement', async ({ page 
   await expect.poll(async () => (
     page.evaluate(() => window.XRRC_DIAGNOSTICS.snapshot().localVehicleSpeed)
   ), { timeout: 5_000 }).toBeGreaterThan(0.7);
-  await page.keyboard.up('w');
+  // Read while the throttle is still down. Sampling after keyboard.up() raced
+  // the aircraft's deceleration: on a fast machine the round trip is a few
+  // milliseconds, but on a loaded CI runner enough time passes for the speed to
+  // decay back below the threshold the poll just proved it had passed.
   const flightSpeed = await page.evaluate(() => (
     window.XRRC_DIAGNOSTICS.snapshot().localVehicleSpeed
   ));
+  await page.keyboard.up('w');
   expect(flightSpeed).toBeGreaterThan(0.7);
 });
 

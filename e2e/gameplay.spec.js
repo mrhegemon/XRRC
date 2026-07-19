@@ -91,7 +91,10 @@ test('renders every procedural vehicle within the scene budget', async ({ page }
 });
 
 test('loads, drives, resets, and recalls all 13 vehicle types', async ({ page }) => {
-  test.setTimeout(150_000);
+  // Cycles all 13 vehicles, which pulls roughly 12MB of GLB skins through the
+  // loader. That is comfortably the slowest test in the suite and it has to
+  // finish on a CI runner doing software rendering.
+  test.setTimeout(300_000);
   const pageErrors = [];
   page.on('pageerror', (error) => pageErrors.push(error.message));
   await page.goto('/?signal=off&mode=desktop&vehicle=rally&rivals=0');

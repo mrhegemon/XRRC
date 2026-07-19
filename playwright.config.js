@@ -8,7 +8,12 @@ module.exports = defineConfig({
   fullyParallel: true,
   forbidOnly: Boolean(process.env.CI),
   retries: process.env.CI ? 1 : 0,
-  workers: 2,
+  // Every spec drives a real WebGL scene. Two of them at once on a CI runner
+  // with software rendering starve each other: pages time out, contexts get
+  // torn down mid-test, and physics assertions read half-simulated state. The
+  // failures look like product bugs but move around between runs. Locally,
+  // where there is a GPU, two workers are fine and roughly halve the wall time.
+  workers: process.env.CI ? 1 : 2,
   reporter: process.env.CI ? [['github'], ['html', { open: 'never' }]] : 'list',
   use: {
     baseURL: 'http://127.0.0.1:3000',
