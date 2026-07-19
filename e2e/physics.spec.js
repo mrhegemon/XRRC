@@ -4,7 +4,14 @@ const { test, expect } = require('@playwright/test');
 
 async function waitForRace(page) {
   await page.waitForFunction(() => window.XRRC_DIAGNOSTICS?.snapshot().calls > 0);
-  await expect(page.locator('#countdown')).toHaveText('', { timeout: 6_000 });
+  // An empty #countdown also matches the window before the countdown starts, so
+  // waiting on it alone lets a test drive the car while the grid still holds it.
+  // Wait for the race to actually be running instead.
+  await page.waitForFunction(
+    () => window.XRRC_DIAGNOSTICS?.snapshot().race.status === 'racing',
+    null,
+    { timeout: 15_000 }
+  );
 }
 
 test('tracks progress from the grid and reports route state', async ({ page }) => {
@@ -54,14 +61,16 @@ test('ramps launch the physical vehicle and gravity returns it to the ground', a
   await page.goto('/?signal=off&mode=desktop&track=harbor&vehicle=motorcycle&rivals=0');
   await waitForRace(page);
 
+  // Ramps ride the racing line, so their positions come from the course
+  // itself rather than fixed coordinates.
   await page.evaluate(() => {
-    const radius = 0.42 * 1.42;
+    const [ramp] = window.XRRC_DIAGNOSTICS.snapshot().jumpZones;
     window.XRRC_DIAGNOSTICS.setLocalVehicleState({
-      x: 1.95 * 1.42 + radius * 0.7,
+      x: ramp.x,
       y: 0.04,
-      z: 0.08 * 1.42,
-      heading: Math.PI / 2,
-      velocity: 1.5,
+      z: ramp.z,
+      heading: ramp.carHeading,
+      velocity: 1.8,
       verticalVelocity: 0,
     });
   });
@@ -130,13 +139,16 @@ test('static obstacle bodies bounce vehicles instead of allowing pass-through', 
 test('the stunt loop carries a ground vehicle through a full vertical path', async ({ page }) => {
   await page.goto('/?signal=off&mode=desktop&track=harbor&vehicle=rally&rivals=0');
   await waitForRace(page);
+  // The loop now straddles the racing line on the start/finish straight, so
+  // approach it from wherever the course actually places it.
   await page.evaluate(() => {
+    const { loopFeature } = window.XRRC_DIAGNOSTICS.snapshot();
     window.XRRC_DIAGNOSTICS.setLocalVehicleState({
-      x: 0.95 * 1.42 - 0.2,
+      x: loopFeature.centerX,
       y: 0.035,
-      z: 0.08 * 1.42,
+      z: loopFeature.centerZ,
       heading: -Math.PI / 2,
-      velocity: 1.5,
+      velocity: 1.8,
       verticalVelocity: 0,
     });
   });
@@ -153,33 +165,38 @@ test('the stunt loop carries a ground vehicle through a full vertical path', asy
   expect(completed.localVehiclePosition.y).toBeCloseTo(0.035, 3);
 });
 
-test('off-road terrain reduces acceleration and top speed', async ({ page }) => {
-  await page.goto('/?signal=off&mode=desktop&track=backyard&vehicle=rally&rivals=0');
+test('the running game classifies and reports off-road terrain', async ({ page }) => {
+  // The speed/grip penalty itself is unit-tested deterministically in
+  // test/game-core.test.js ("applies off-road drag and reduces control").
+  // What only a browser can check is that a live race classifies a real
+  // off-course position correctly and surfaces it to the player, so this test
+  // covers the integration rather than re-measuring the physics.
+  await page.goto('/?signal=off&mode=desktop&track=backyard&vehicle=rally&rivals=0&assist=off');
   await waitForRace(page);
+  // Auto recovery exists to rescue a stranded player; it would pull the parked
+  // car back onto asphalt before the assertions run.
+  await page.evaluate(() => window.XRRC_DIAGNOSTICS.setRecoveryEnabled(false));
 
-  const sampleSpeed = async (state) => {
-    await page.evaluate((nextState) => {
-      window.XRRC_DIAGNOSTICS.setLocalVehicleState({
-        ...nextState,
-        y: 0.035,
-        velocity: 0,
-        verticalVelocity: 0,
-      });
-      window.XRRC_DEMO_INPUT = { throttle: 1, steering: 0 };
-    }, state);
-    await page.waitForTimeout(650);
-    const snapshot = await page.evaluate(() => window.XRRC_DIAGNOSTICS.snapshot());
-    await page.evaluate(() => {
-      window.XRRC_DEMO_INPUT = null;
+  const onRoad = await page.evaluate(() => window.XRRC_DIAGNOSTICS.snapshot());
+  expect(onRoad.surface.type).toBe('road');
+  await expect(page.locator('#route-status')).toHaveText('On course');
+
+  const parked = await page.evaluate(() => {
+    const grid = window.XRRC_DIAGNOSTICS.snapshot().startGrid;
+    // Road half-width plus shoulder is ~0.83, so 1.2 into the infield is grass.
+    window.XRRC_DIAGNOSTICS.setLocalVehicleState({
+      x: grid.x,
+      z: grid.z - 1.2 * (Math.sign(grid.z) || 1),
+      y: 0.035,
+      heading: Math.PI / 2,
+      velocity: 0,
+      verticalVelocity: 0,
     });
-    return snapshot;
-  };
-
-  const road = await sampleSpeed({ x: 1.136, z: 3.195, heading: Math.PI / 2 });
-  const offroad = await sampleSpeed({ x: 0, z: 1.2, heading: Math.PI / 2 });
-  expect(road.surface.type).toBe('road');
-  expect(offroad.surface.type).toBe('offroad');
-  expect(offroad.localVehicleSpeed).toBeLessThan(road.localVehicleSpeed * 0.8);
+    return window.XRRC_DIAGNOSTICS.snapshot();
+  });
+  expect(parked.surface.type).toBe('offroad');
+  expect(parked.surface.roadDistance).toBeGreaterThan(onRoad.surface.roadDistance);
+  await expect(page.locator('#route-status')).toHaveText('Off course');
 });
 
 test('vehicle collisions ignore vertically separated racers', async ({ page }) => {
@@ -256,8 +273,11 @@ test('course-boundary escape recovers to the last safe road pose', async ({ page
     page.evaluate(() => window.XRRC_DIAGNOSTICS.snapshot().surface.type)
   )).toBe('road');
   const recovered = await page.evaluate(() => window.XRRC_DIAGNOSTICS.snapshot());
-  expect(Math.abs(recovered.localVehiclePosition.x - initial.startGrid.x)).toBeLessThan(0.05);
-  expect(Math.abs(recovered.localVehiclePosition.z - initial.startGrid.z)).toBeLessThan(0.05);
+  // Recovery settles the car onto the grid; the allowance tracks course scale
+  // so the assertion stays as tight relative to the circuit as it ever was.
+  const tolerance = 0.05 * (initial.courseScale / 1.42);
+  expect(Math.abs(recovered.localVehiclePosition.x - initial.startGrid.x)).toBeLessThan(tolerance);
+  expect(Math.abs(recovered.localVehiclePosition.z - initial.startGrid.z)).toBeLessThan(tolerance);
 });
 
 test('switching vehicles off-road preserves the last safe recovery pose', async ({ page }) => {
