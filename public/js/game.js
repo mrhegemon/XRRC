@@ -12,7 +12,13 @@ const ShareCore = window.XRRCShareCore;
 const TrackCore = window.XRRCTrackCore;
 const RaceCore = window.XRRCRaceCore;
 const COURSE_SCALE = 2.15;
-const XR_WORLD_SCALE = 0.4;
+// A placed AR course has to stay room-sized no matter how large the circuits
+// get on screen. courseRoot is scaled by COURSE_SCALE, so the XR root scales
+// inversely to hold the physical footprint at roughly five metres across.
+// Deriving it means growing the circuits can never quietly inflate the AR
+// course past the space someone is standing in.
+const XR_COURSE_SPAN = 0.568;
+const XR_WORLD_SCALE = XR_COURSE_SPAN / COURSE_SCALE;
 const MAX_FRAME_CATCHUP = 0.25;
 const MAX_SIMULATION_STEP = 0.05;
 const TRACK_BOUNDS = Object.freeze({
@@ -224,7 +230,28 @@ let networkManager = null;
 let toastTimer = null;
 let shareCopyTimer = null;
 let shareQrRequest = 0;
+// 8th Wall's hosted platform retired on 2026-02-28; the engine is now
+// distributed as a proprietary binary on npm. Versions are pinned exactly
+// rather than floated on a major range, because a silent bump to a closed
+// binary would break camera AR in production with nothing in the repo changing.
+const EIGHTH_WALL_VERSION = '1.0.0';
+const EIGHTH_WALL_SCRIPTS = Object.freeze([
+  {
+    url: `https://cdn.jsdelivr.net/npm/@8thwall/engine-binary@${EIGHTH_WALL_VERSION}/dist/xr.js`,
+    attributes: { async: '', crossorigin: 'anonymous', 'data-preload-chunks': 'slam' },
+  },
+  {
+    url: `https://cdn.jsdelivr.net/npm/@8thwall/xrextras@${EIGHTH_WALL_VERSION}/dist/xrextras.js`,
+    attributes: { crossorigin: 'anonymous' },
+  },
+  {
+    url: `https://cdn.jsdelivr.net/npm/@8thwall/landing-page@${EIGHTH_WALL_VERSION}/dist/landing-page.js`,
+    attributes: { crossorigin: 'anonymous' },
+  },
+]);
+const EIGHTH_WALL_START_TIMEOUT_MS = 45000;
 let eighthWallConfigured = false;
+let notifyEighthWallStarted = null;
 let qrCodeModulePromise = null;
 let webXRSupportChecked = false;
 let webXRSupported = false;
@@ -4656,20 +4683,26 @@ async function start8thWall() {
       if (window.XR8) resolve();
       else window.addEventListener('xrloaded', resolve, { once: true });
     });
-    await Promise.all([
-      loadScript('https://cdn.jsdelivr.net/npm/@8thwall/engine-binary@1/dist/xr.js', {
-        async: '',
-        crossorigin: 'anonymous',
-        'data-preload-chunks': 'slam',
-      }),
-      loadScript('https://cdn.jsdelivr.net/npm/@8thwall/xrextras@1/dist/xrextras.js', {
-        crossorigin: 'anonymous',
-      }),
-      loadScript('https://cdn.jsdelivr.net/npm/@8thwall/landing-page@1/dist/landing-page.js', {
-        crossorigin: 'anonymous',
-      }),
-    ]);
+    await Promise.all(EIGHTH_WALL_SCRIPTS.map(
+      ({ url, attributes }) => loadScript(url, attributes)
+    ));
     await xrReady;
+
+    // The engine takes over the whole screen with a "continue on your phone"
+    // landing page when it is loaded somewhere without a usable camera, and
+    // there is no way back from it. Say so here instead.
+    const estimate = window.XR8.XrDevice?.deviceEstimate?.();
+    if (estimate && estimate.type !== 'mobile') {
+      throw new Error(I18n.t('status.cameraMobileOnly'));
+    }
+    if (window.XR8.XrDevice?.isDeviceBrowserCompatible?.() === false) {
+      const reasons = window.XR8.XrDevice.incompatibleReasons?.() || [];
+      throw new Error(reasons.join(', ') || I18n.t('status.cameraUnsupported'));
+    }
+
+    const started = new Promise((resolve) => {
+      notifyEighthWallStarted = resolve;
+    });
     if (!eighthWallConfigured) {
       window.XR8.addCameraPipelineModules(
         XRCore.createEighthWallModules({
@@ -4680,6 +4713,7 @@ async function start8thWall() {
           onStart: () => {
             const activeGame = enterGame(window.XR8.Threejs.xrScene());
             activeGame.place();
+            if (notifyEighthWallStarted) notifyEighthWallStarted();
           },
           onUpdate: () => {
             if (game) game.update();
@@ -4688,8 +4722,22 @@ async function start8thWall() {
       );
       eighthWallConfigured = true;
     }
-    await window.XR8.run({ canvas: document.getElementById('scene') });
+
+    // XR8.run() resolves once the pipeline has the canvas, not once the camera
+    // feed is live, and a pipeline that fails to start never rejects it.
+    // Awaiting it therefore left the lobby stuck on "Loading camera mode..."
+    // with the button disabled and no error. Wait for our own onStart instead,
+    // with a ceiling generous enough to cover the camera permission prompt.
+    window.XR8.run({ canvas: document.getElementById('scene') });
+    await Promise.race([
+      started,
+      new Promise((resolve, reject) => setTimeout(
+        () => reject(new Error(I18n.t('status.cameraTimeout'))),
+        EIGHTH_WALL_START_TIMEOUT_MS
+      )),
+    ]);
   } catch (error) {
+    notifyEighthWallStarted = null;
     button.disabled = false;
     document.getElementById('lobby-status').textContent = I18n.t(
       'status.cameraError',

@@ -42,7 +42,7 @@ behind Tailscale Serve.
 - Native immersive WebXR and an on-demand 8th Wall camera pipeline.
 - A Quest quality profile and instanced track props that keep the reference
   scene within the automated render budget.
-- 65 Node tests, 35 Playwright browser tests, CI, and deterministic screenshots.
+- 65 Node tests, 37 Playwright browser tests, CI, and deterministic screenshots.
 
 ## Visual gallery
 
@@ -273,11 +273,24 @@ XRRC requests:
 When hit testing is available, tap the reticle or use an XR controller select
 action to place the course. If the browser grants the session without hit-test
 support, the course is placed 2.7 meters in front of the viewer. The enlarged AR
-course uses a `0.4` world scale to preserve a room-friendly physical footprint.
+course scales inversely to `COURSE_SCALE` so a placed course stays roughly five
+metres across. Enlarging the circuits therefore cannot quietly inflate the AR
+footprint past the room someone is standing in, and the browser tests assert the
+product of the two scales rather than either one alone.
 
 ### 8th Wall
 
-Selecting 8th Wall loads the current engine binary, XRExtras, and landing-page
+8th Wall's hosted platform retired on 28 February 2026, so there is no
+`apps.8thwall.com/xrweb?appKey=...` script and no app key to configure. The
+engine is the freely distributed npm binary instead, pinned to an exact version
+rather than a floating major range - a silent bump to a closed-source binary
+would otherwise break camera AR in production with nothing in the repo changing.
+
+iOS Safari has no WebXR, so camera mode is the only AR route on iPhone and iPad.
+The lobby detects this: `navigator.xr.isSessionSupported('immersive-ar')` gates
+the WebXR button, and camera mode is offered independently.
+
+Selecting 8th Wall loads the pinned engine binary, XRExtras, and landing-page
 packages from jsDelivr, then registers:
 
 - GL texture rendering;
@@ -286,8 +299,15 @@ packages from jsDelivr, then registers:
 - landing, loading, full-window canvas, and runtime-error modules;
 - the XRRC start/update pipeline.
 
-No legacy 8th Wall app key is embedded in the repository. The engine binary is
-subject to the
+`XR8.run()` resolves once the pipeline has the canvas, not once the camera feed
+is live, and a pipeline that fails to start never rejects it. Camera mode
+therefore waits on its own `onStart` callback with a timeout, so a stalled or
+refused start reports an error and re-enables the button instead of leaving the
+lobby on "Loading camera mode..." forever. Desktop browsers are told camera mode
+needs a phone rather than being dropped into the engine's full-screen
+"continue on your phone" landing page, which has no way back.
+
+The engine binary is subject to the
 [Niantic Spatial XR Engine License](https://github.com/8thwall/engine/blob/main/LICENSE);
 the companion packages retain their respective licenses.
 
