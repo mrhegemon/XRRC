@@ -73,10 +73,12 @@
     return url;
   }
 
-  function buildSignalUrl(value, room, pageProtocol = 'https:') {
+  function buildSignalUrl(value, room, pageProtocol = 'https:', track = null) {
     const url = normalizeSignalUrl(value, pageProtocol);
     if (!url) return null;
     url.searchParams.set('room', normalizeRoom(room));
+    if (track) url.searchParams.set('track', String(track));
+    else url.searchParams.delete('track');
     return url.toString();
   }
 
@@ -89,9 +91,10 @@
     return url.toString();
   }
 
-  function buildShareUrl(locationHref, room, signalValue) {
+  function buildShareUrl(locationHref, room, signalValue, track = null) {
     const url = new URL(locationHref);
     url.searchParams.set('room', normalizeRoom(room));
+    if (track) url.searchParams.set('track', String(track));
     if (String(signalValue || '').trim()) {
       const signal = normalizeSignalUrl(signalValue, url.protocol);
       url.searchParams.set('signal', signal.toString());

@@ -43,7 +43,7 @@ async function installShareMocks(page) {
 
 async function openShareDialog(page, language = 'en') {
   await installShareMocks(page);
-  await page.goto(`/?signal=off&mode=desktop&room=Pit%20Crew&lang=${language}`);
+  await page.goto(`/?signal=off&mode=desktop&room=Pit%20Crew&track=alpine&lang=${language}`);
   await page.waitForFunction(() => window.XRRC_DIAGNOSTICS?.snapshot().calls > 0);
   await page.locator('#share-link').click();
   await expect(page.locator('#share-dialog')).toBeVisible();
@@ -59,10 +59,11 @@ test('renders a QR room pass with direct and native share actions', async ({ pag
   const invite = await page.locator('#share-url').inputValue();
   const inviteUrl = new URL(invite);
   expect(inviteUrl.searchParams.get('room')).toBe('pit-crew');
+  expect(inviteUrl.searchParams.get('track')).toBe('alpine');
   expect(inviteUrl.searchParams.has('signal')).toBe(false);
   await expect(page.locator('#share-qr')).toHaveAttribute('data-encoded-by-test', invite);
 
-  const expectedMessage = `Join my XRRC backyard rally.\n\n${invite}`;
+  const expectedMessage = `Join my XRRC race on Alpine Pass.\n\n${invite}`;
   const email = new URL(await page.locator('#share-email').getAttribute('href'));
   const sms = new URL(await page.locator('#share-sms').getAttribute('href'));
   const whatsapp = new URL(await page.locator('#share-whatsapp').getAttribute('href'));
@@ -77,7 +78,7 @@ test('renders a QR room pass with direct and native share actions', async ({ pag
 
   await page.locator('#share-native').click();
   expect(await page.evaluate(() => window.__NATIVE_SHARE__)).toEqual({
-    text: 'Join my XRRC backyard rally.',
+    text: 'Join my XRRC race on Alpine Pass.',
     title: 'XRRC room #pit-crew',
     url: invite,
   });

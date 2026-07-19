@@ -115,6 +115,9 @@
         copy: [740, 0.08, 'sine', 0.045],
         reset: [260, 0.12, 'triangle', 0.055],
         toggle: [520, 0.06, 'sine', 0.035],
+        sector: [560, 0.08, 'triangle', 0.045],
+        finish: [740, 0.22, 'sawtooth', 0.07],
+        boost: [180, 0.2, 'sawtooth', 0.07],
       };
 
       if (name === 'impact') {
@@ -128,6 +131,13 @@
       this._tone(...cue);
       if (name === 'go') {
         this._tone(880, 0.13, 'triangle', 0.045, 0.035);
+      } else if (name === 'sector') {
+        this._tone(700, 0.07, 'sine', 0.035, 0.045);
+      } else if (name === 'finish') {
+        this._tone(920, 0.25, 'triangle', 0.055, 0.08);
+      } else if (name === 'boost') {
+        this._noiseBurst(0.16, 0.08);
+        this._tone(320, 0.18, 'sawtooth', 0.045, 0.04);
       }
     }
 

@@ -16,6 +16,8 @@
     constructor() {
       super();
       this.localId = null;
+      this.hostId = null;
+      this.isHost = false;
       this._ws = null;
       this._wsUrl = null;
       this._peers = new Map();
@@ -35,6 +37,8 @@
       this.disconnect();
       this._wsUrl = wsUrl;
       this._intentionalClose = false;
+      this.hostId = null;
+      this.isHost = false;
       this._openSocket();
     }
 
@@ -48,6 +52,9 @@
         this._ws.close();
         this._ws = null;
       }
+      this.localId = null;
+      this.hostId = null;
+      this.isHost = false;
     }
 
     broadcastState(state) {
@@ -56,6 +63,13 @@
         if (dc && dc.readyState === 'open' && dc.bufferedAmount < 64 * 1024) {
           dc.send(data);
         }
+      });
+    }
+
+    broadcastRace(race) {
+      const data = JSON.stringify({ race });
+      this._peers.forEach(({ raceDc }) => {
+        if (raceDc && raceDc.readyState === 'open') raceDc.send(data);
       });
     }
 
@@ -110,6 +124,8 @@
       switch (message.type) {
         case 'welcome':
           this.localId = message.id;
+          this.hostId = message.host || message.peers[0] || message.id;
+          this.isHost = this.localId === this.hostId;
           for (const peerId of message.peers) await this._createOffer(peerId);
           this.dispatchEvent(new CustomEvent('ready', {
             detail: { id: this.localId },
@@ -119,6 +135,13 @@
           break;
         case 'peer-left':
           this._removePeer(message.id);
+          break;
+        case 'host-changed':
+          this.hostId = message.id;
+          this.isHost = this.localId === this.hostId;
+          this.dispatchEvent(new CustomEvent('host-change', {
+            detail: { id: this.hostId, isHost: this.isHost },
+          }));
           break;
         case 'offer':
           await this._handleOffer(message.from, message.sdp);
@@ -148,6 +171,7 @@
         this._peers.set(peerId, {
           pc: null,
           dc: null,
+          raceDc: null,
           color: this._nextColor(),
           announced: false,
         });
@@ -181,6 +205,9 @@
       });
       record.dc = dc;
       this._setupDataChannel(dc, peerId);
+      const raceDc = pc.createDataChannel('rc-race');
+      record.raceDc = raceDc;
+      this._setupRaceChannel(raceDc, peerId);
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       this._send({ type: 'offer', to: peerId, sdp: pc.localDescription });
@@ -190,8 +217,13 @@
       const pc = this._buildPeerConnection(peerId);
       pc.ondatachannel = ({ channel }) => {
         const record = this._createPeerRecord(peerId);
-        record.dc = channel;
-        this._setupDataChannel(channel, peerId);
+        if (channel.label === 'rc-race') {
+          record.raceDc = channel;
+          this._setupRaceChannel(channel, peerId);
+        } else {
+          record.dc = channel;
+          this._setupDataChannel(channel, peerId);
+        }
       };
       await pc.setRemoteDescription(new RTCSessionDescription(sdp));
       const answer = await pc.createAnswer();
@@ -243,10 +275,26 @@
       if (dc.readyState === 'open') announcePeer();
     }
 
+    _setupRaceChannel(dc, peerId) {
+      dc.onmessage = ({ data }) => {
+        try {
+          const message = JSON.parse(data);
+          if (!message || typeof message.race !== 'object') return;
+          this.dispatchEvent(new CustomEvent('peer-race', {
+            detail: { id: peerId, race: message.race },
+          }));
+        } catch {
+          this._emitStatus('error', 'Peer sent invalid race data');
+        }
+      };
+      dc.onerror = (error) => console.warn('[net] Race channel error:', error);
+    }
+
     _removePeer(peerId) {
       const record = this._peers.get(peerId);
       if (!record) return;
       if (record.dc && record.dc.readyState !== 'closed') record.dc.close();
+      if (record.raceDc && record.raceDc.readyState !== 'closed') record.raceDc.close();
       if (record.pc && record.pc.connectionState !== 'closed') record.pc.close();
       this._peers.delete(peerId);
       if (record.announced) {

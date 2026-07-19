@@ -6,6 +6,7 @@ const { randomUUID } = require('node:crypto');
 const express = require('express');
 const { WebSocket, WebSocketServer } = require('ws');
 const { normalizeRoom } = require('./public/js/config');
+const { normalizeTrackId } = require('./public/js/track-core');
 
 const DEFAULT_ORIGINS = ['https://lab.liambroza.com'];
 const SIGNAL_TYPES = new Set(['offer', 'answer', 'ice']);
@@ -91,12 +92,16 @@ function createXrrcServer(options = {}) {
   wss.on('connection', (ws, req) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const roomName = normalizeRoom(url.searchParams.get('room'));
+    const trackId = normalizeTrackId(url.searchParams.get('track'));
+    const roomKey = `${roomName}:${trackId}`;
     const id = randomUUID();
-    const room = getRoom(roomName);
+    const room = getRoom(roomKey);
+    const hostId = room.keys().next().value || id;
 
     ws.isAlive = true;
     ws.rcId = id;
     ws.rcRoom = roomName;
+    ws.rcTrack = trackId;
     ws.on('pong', () => {
       ws.isAlive = true;
     });
@@ -104,7 +109,9 @@ function createXrrcServer(options = {}) {
     send(ws, {
       type: 'welcome',
       id,
+      host: hostId,
       peers: Array.from(room.keys()),
+      track: trackId,
     });
     broadcastToRoom(room, ws, { type: 'peer-joined', id });
     room.set(id, ws);
@@ -144,9 +151,16 @@ function createXrrcServer(options = {}) {
     });
 
     ws.on('close', () => {
+      const wasHost = room.keys().next().value === id;
       room.delete(id);
       broadcastToRoom(room, ws, { type: 'peer-left', id });
-      if (room.size === 0) rooms.delete(roomName);
+      if (wasHost && room.size > 0) {
+        broadcastToRoom(room, ws, {
+          type: 'host-changed',
+          id: room.keys().next().value,
+        });
+      }
+      if (room.size === 0) rooms.delete(roomKey);
     });
 
     ws.on('error', (error) => {

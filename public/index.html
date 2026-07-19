@@ -38,7 +38,7 @@
     ></canvas>
 
     <div id="overlay">
-      <main id="lobby" tabindex="-1">
+      <main id="lobby" tabindex="-1" aria-busy="true">
         <div class="track-backdrop" aria-hidden="true">
           <span class="track-line track-line-one"></span>
           <span class="track-line track-line-two"></span>
@@ -136,6 +136,78 @@
               <p id="room-help" class="field-help">Use the same code to race with friends.</p>
             </div>
 
+            <fieldset class="track-field">
+              <legend>Course map</legend>
+              <div class="track-rail">
+                <label class="track-toggle" data-track-card="backyard">
+                  <input type="radio" name="track" value="backyard" checked />
+                  <span class="track-map" aria-hidden="true">
+                    <svg viewBox="0 0 56 36"><path d="M9 20C8 8 21 5 31 8s19 7 16 17-15 7-22 5S10 32 9 20Z" /></svg>
+                    <i>01</i>
+                  </span>
+                  <span class="track-copy">
+                    <strong data-i18n="track.backyard">Backyard Rally</strong>
+                    <small data-i18n="track.backyardNote">Garden dirt</small>
+                  </span>
+                </label>
+                <label class="track-toggle" data-track-card="alpine">
+                  <input type="radio" name="track" value="alpine" />
+                  <span class="track-map" aria-hidden="true">
+                    <svg viewBox="0 0 56 36"><path d="M8 24C10 8 24 6 28 16s8 15 17 8c7-5 4-14-4-16" /></svg>
+                    <i>02</i>
+                  </span>
+                  <span class="track-copy">
+                    <strong data-i18n="track.alpine">Alpine Pass</strong>
+                    <small data-i18n="track.alpineNote">Snow + switchbacks</small>
+                  </span>
+                </label>
+                <label class="track-toggle" data-track-card="desert">
+                  <input type="radio" name="track" value="desert" />
+                  <span class="track-map" aria-hidden="true">
+                    <svg viewBox="0 0 56 36"><path d="M8 18c2-11 15-12 23-8s18 2 18 11-11 12-20 8S6 31 8 18Z" /></svg>
+                    <i>03</i>
+                  </span>
+                  <span class="track-copy">
+                    <strong data-i18n="track.desert">Desert Run</strong>
+                    <small data-i18n="track.desertNote">Sand + canyon</small>
+                  </span>
+                </label>
+                <label class="track-toggle" data-track-card="harbor">
+                  <input type="radio" name="track" value="harbor" />
+                  <span class="track-map" aria-hidden="true">
+                    <svg viewBox="0 0 56 36"><path d="M8 9h18v9H15v10h33V10H36v17" /></svg>
+                    <i>04</i>
+                  </span>
+                  <span class="track-copy">
+                    <strong data-i18n="track.harbor">Neon Harbor</strong>
+                    <small data-i18n="track.harborNote">Docks after dark</small>
+                  </span>
+                </label>
+                <label class="track-toggle" data-track-card="sakura">
+                  <input type="radio" name="track" value="sakura" />
+                  <span class="track-map" aria-hidden="true">
+                    <svg viewBox="0 0 56 36"><path d="M8 22c2-13 14-17 23-10s17 4 18 11-8 10-17 6-9-9-15-2" /></svg>
+                    <i>05</i>
+                  </span>
+                  <span class="track-copy">
+                    <strong data-i18n="track.sakura">Sakura Sprint</strong>
+                    <small data-i18n="track.sakuraNote">Blossom garden</small>
+                  </span>
+                </label>
+                <label class="track-toggle" data-track-card="lunar">
+                  <input type="radio" name="track" value="lunar" />
+                  <span class="track-map" aria-hidden="true">
+                    <svg viewBox="0 0 56 36"><path d="M10 10 28 6l18 7 3 13-17 5-20-4Z" /></svg>
+                    <i>06</i>
+                  </span>
+                  <span class="track-copy">
+                    <strong data-i18n="track.lunar">Lunar Circuit</strong>
+                    <small data-i18n="track.lunarNote">Craters + low light</small>
+                  </span>
+                </label>
+              </div>
+            </fieldset>
+
             <fieldset class="vehicle-field">
               <legend>Vehicle bay</legend>
               <div class="vehicle-rail">
@@ -205,6 +277,71 @@
                   <strong>Coupe</strong>
                 </label>
               </div>
+              <div
+                id="vehicle-profile"
+                class="vehicle-profile"
+                aria-live="polite"
+                aria-atomic="true"
+              >
+                <div class="vehicle-profile-copy">
+                  <strong id="vehicle-role">All-rounder</strong>
+                  <p id="vehicle-note">Balanced pace, grip, and recovery for any circuit.</p>
+                </div>
+                <dl class="vehicle-ratings">
+                  <div>
+                    <dt data-i18n="vehicle.speed">Speed</dt>
+                    <dd
+                      id="vehicle-rating-speed"
+                      class="rating-meter"
+                      role="meter"
+                      aria-label="Speed: 4 / 5"
+                      aria-valuemin="1"
+                      aria-valuemax="5"
+                      aria-valuenow="4"
+                      style="--rating: 4"
+                    ><span aria-hidden="true"></span></dd>
+                  </div>
+                  <div>
+                    <dt data-i18n="vehicle.acceleration">Launch</dt>
+                    <dd
+                      id="vehicle-rating-acceleration"
+                      class="rating-meter"
+                      role="meter"
+                      aria-label="Launch: 4 / 5"
+                      aria-valuemin="1"
+                      aria-valuemax="5"
+                      aria-valuenow="4"
+                      style="--rating: 4"
+                    ><span aria-hidden="true"></span></dd>
+                  </div>
+                  <div>
+                    <dt data-i18n="vehicle.handling">Handling</dt>
+                    <dd
+                      id="vehicle-rating-handling"
+                      class="rating-meter"
+                      role="meter"
+                      aria-label="Handling: 4 / 5"
+                      aria-valuemin="1"
+                      aria-valuemax="5"
+                      aria-valuenow="4"
+                      style="--rating: 4"
+                    ><span aria-hidden="true"></span></dd>
+                  </div>
+                  <div>
+                    <dt data-i18n="vehicle.stability">Stability</dt>
+                    <dd
+                      id="vehicle-rating-stability"
+                      class="rating-meter"
+                      role="meter"
+                      aria-label="Stability: 4 / 5"
+                      aria-valuemin="1"
+                      aria-valuemax="5"
+                      aria-valuenow="4"
+                      style="--rating: 4"
+                    ><span aria-hidden="true"></span></dd>
+                  </div>
+                </dl>
+              </div>
             </fieldset>
 
             <fieldset class="kit-field">
@@ -223,6 +360,31 @@
                 <input id="prop-traffic" type="checkbox" checked />
                 <span class="kit-symbol cone-symbol" aria-hidden="true">A</span>
                 <span><strong>Street kit</strong><small>Cones + lights</small></span>
+              </label>
+            </fieldset>
+
+            <fieldset class="race-rules">
+              <legend data-i18n="setup.raceRules">Race rules</legend>
+              <label class="rule-select" for="lap-count">
+                <span><strong data-i18n="setup.laps">Laps</strong><small data-i18n="setup.lapsNote">Circuit length</small></span>
+                <select id="lap-count">
+                  <option value="1">1</option>
+                  <option value="3" selected>3</option>
+                  <option value="5">5</option>
+                </select>
+              </label>
+              <label class="rule-select" for="ai-count">
+                <span><strong data-i18n="setup.rivals">Rivals</strong><small data-i18n="setup.rivalsNote">Solo opponents</small></span>
+                <select id="ai-count">
+                  <option value="0">0</option>
+                  <option value="3" selected>3</option>
+                  <option value="5">5</option>
+                </select>
+              </label>
+              <label class="rule-check">
+                <input id="steering-assist" type="checkbox" checked />
+                <span aria-hidden="true">+</span>
+                <span><strong data-i18n="setup.assist">Steering assist</strong><small data-i18n="setup.assistNote">Gentle course correction</small></span>
               </label>
             </fieldset>
 
@@ -272,7 +434,7 @@
               <button id="webxr-btn" class="race-btn primary-btn" type="button" disabled>
                 <span>Checking WebXR</span><small>AR / best ride</small>
               </button>
-              <button id="desktop-btn" class="race-btn secondary-btn" type="button">
+              <button id="desktop-btn" class="race-btn secondary-btn" type="button" disabled>
                 <span>Desktop race</span><small>Keyboard + gamepad</small>
               </button>
               <button id="eighthwall-btn" class="text-btn" type="button" disabled>
@@ -296,6 +458,11 @@
             <strong id="speed-value">00</strong>
             <small>km/h</small>
           </div>
+          <div class="race-clock" aria-label="Race timing" data-i18n-aria-label="race.timing">
+            <span data-i18n="race.time">Race time</span>
+            <strong id="race-time">0:00.000</strong>
+            <small><span data-i18n="race.best">Best</span> <b id="best-lap-time">--:--.---</b></small>
+          </div>
           <div id="network-pill" class="network-pill" data-state="solo">
             <span class="status-dot" aria-hidden="true"></span>
             <span id="network-label" data-i18n="race.solo">Solo heat</span>
@@ -304,10 +471,50 @@
           <div class="hud-actions">
             <button id="share-link" class="hud-btn" type="button" hidden data-i18n="race.invite">Invite</button>
             <button id="reset-btn" class="hud-btn" type="button" data-i18n="race.resetAction">Reset</button>
+            <button id="pause-btn" class="hud-btn" type="button" data-i18n="race.pause">Pause</button>
             <button class="hud-btn audio-hud" type="button" data-audio-toggle="sfx" aria-pressed="true">SFX</button>
             <button class="hud-btn audio-hud" type="button" data-audio-toggle="music" aria-pressed="true" data-i18n="audio.music">Music</button>
           </div>
         </div>
+
+        <div id="race-guide" class="race-guide" data-state="road">
+          <div class="race-guide-copy">
+            <strong id="lap-label">Lap 1 / 3</strong>
+            <span id="sector-label">Sector 1 / 4</span>
+          </div>
+          <div
+            id="race-progress-bar"
+            class="race-progress"
+            role="progressbar"
+            aria-label="Course progress"
+            data-i18n-aria-label="race.progress"
+            aria-valuemin="0"
+            aria-valuemax="100"
+            aria-valuenow="0"
+          ><span aria-hidden="true"></span></div>
+          <strong id="route-status">On course</strong>
+          <strong id="position-label" class="position-label">P1 / 4</strong>
+        </div>
+
+        <div
+          id="boost-meter"
+          class="boost-meter"
+          role="progressbar"
+          aria-label="Drift boost"
+          data-i18n-aria-label="race.boost"
+          aria-valuemin="0"
+          aria-valuemax="100"
+          aria-valuenow="0"
+          style="--boost-charge: 0%"
+        >
+          <span data-i18n="race.boost">Drift boost</span>
+          <i aria-hidden="true"><b></b></i>
+        </div>
+
+        <aside class="standings" aria-labelledby="standings-title">
+          <strong id="standings-title" data-i18n="race.standings">Standings</strong>
+          <ol id="standings-list"></ol>
+        </aside>
 
         <div id="vehicle-bay" class="vehicle-bay" role="listbox" aria-label="Vehicle bay"></div>
 
@@ -318,20 +525,122 @@
         </div>
 
         <div id="joystick-zone">
-          <div id="joystick" aria-label="Touch steering and throttle">
+          <div
+            id="joystick"
+            role="group"
+            tabindex="0"
+            aria-label="Touch steering and throttle"
+            data-i18n-aria-label="touch.joystick"
+            aria-describedby="joystick-help"
+          >
             <span class="joystick-axis" aria-hidden="true"></span>
             <div id="joystick-knob"></div>
           </div>
-          <span class="joystick-label" data-i18n="race.drag">Drag to drive</span>
+          <div
+            class="touch-button-grid"
+            role="group"
+            aria-label="Discrete driving controls"
+            data-i18n-aria-label="touch.buttons"
+          >
+            <button
+              class="touch-control touch-altitude"
+              type="button"
+              data-touch-axis="lift"
+              data-touch-value="1"
+              aria-label="Rise"
+              data-i18n-aria-label="touch.rise"
+            >UP</button>
+            <button
+              class="touch-control"
+              type="button"
+              data-touch-axis="throttle"
+              data-touch-value="1"
+              aria-label="Drive forward"
+              data-i18n-aria-label="touch.forward"
+            >GO</button>
+            <button
+              class="touch-control touch-altitude"
+              type="button"
+              data-touch-axis="lift"
+              data-touch-value="-1"
+              aria-label="Descend"
+              data-i18n-aria-label="touch.descend"
+            >DN</button>
+            <button
+              class="touch-control"
+              type="button"
+              data-touch-axis="steering"
+              data-touch-value="-1"
+              aria-label="Steer left"
+              data-i18n-aria-label="touch.left"
+            >L</button>
+            <button
+              class="touch-control"
+              type="button"
+              data-touch-axis="throttle"
+              data-touch-value="-1"
+              aria-label="Reverse"
+              data-i18n-aria-label="touch.reverse"
+            >REV</button>
+            <button
+              class="touch-control"
+              type="button"
+              data-touch-axis="steering"
+              data-touch-value="1"
+              aria-label="Steer right"
+              data-i18n-aria-label="touch.right"
+            >R</button>
+          </div>
+          <span id="joystick-help" class="joystick-label" data-i18n="race.drag">Drag to drive</span>
         </div>
 
         <div id="key-hint" class="key-hint">
           <span><kbd>WASD</kbd> <span data-i18n="race.driveKeys">or arrows to drive</span></span>
+          <span class="flight-key-hint"><kbd>Space / Shift</kbd> <span data-i18n="race.flightKeys">altitude</span></span>
           <span><kbd>R</kbd> <span data-i18n="race.resetKey">to reset</span></span>
           <span id="controller-status" class="controller-status" data-state="keyboard" data-i18n="controller.keyboard">Keyboard ready</span>
         </div>
       </section>
     </div>
+
+    <dialog id="pause-dialog" class="race-dialog" aria-labelledby="pause-title">
+      <div class="race-sheet pause-sheet">
+        <p class="race-sheet-kicker" data-i18n="pause.kicker">Race control</p>
+        <h2 id="pause-title" data-i18n="pause.title">Yellow flag</h2>
+        <p data-i18n="pause.description">The clock and every racer are stopped.</p>
+        <button id="pause-assist" class="race-setting" type="button" aria-pressed="true">
+          <span data-i18n="setup.assist">Steering assist</span>
+          <strong data-i18n="common.on">On</strong>
+        </button>
+        <div class="race-dialog-actions">
+          <button id="resume-btn" class="race-action-primary" type="button" data-i18n="pause.resume">Resume</button>
+          <button id="retry-btn" type="button" data-i18n="pause.retry">Restart race</button>
+          <button id="quit-btn" type="button" data-i18n="pause.quit">Return to lobby</button>
+        </div>
+      </div>
+    </dialog>
+
+    <dialog id="results-dialog" class="race-dialog" aria-labelledby="results-title">
+      <div class="race-sheet results-sheet">
+        <p class="race-sheet-kicker" data-i18n="results.kicker">Official timing</p>
+        <h2 id="results-title" data-i18n="results.title">Heat complete</h2>
+        <div class="results-hero">
+          <span id="results-position">P1 / 4</span>
+          <strong id="results-time">0:00.000</strong>
+          <small id="results-record" data-i18n="results.record">Personal best</small>
+        </div>
+        <table class="lap-table">
+          <thead>
+            <tr><th data-i18n="results.lap">Lap</th><th data-i18n="results.time">Time</th></tr>
+          </thead>
+          <tbody id="results-laps"></tbody>
+        </table>
+        <div class="race-dialog-actions">
+          <button id="results-retry-btn" class="race-action-primary" type="button" data-i18n="results.retry">Race again</button>
+          <button id="results-lobby-btn" type="button" data-i18n="pause.quit">Return to lobby</button>
+        </div>
+      </div>
+    </dialog>
 
     <dialog
       id="share-dialog"
@@ -416,7 +725,9 @@
     <script src="js/config.js"></script>
     <script src="js/i18n.js"></script>
     <script src="js/share-core.js"></script>
+    <script src="js/track-core.js"></script>
     <script src="js/game-core.js"></script>
+    <script src="js/race-core.js"></script>
     <script src="js/controls-core.js"></script>
     <script src="js/xr-core.js"></script>
     <script src="js/network.js"></script>

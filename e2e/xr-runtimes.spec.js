@@ -52,16 +52,26 @@ test('starts the complete 8th Wall pipeline with camera runtime modules', async 
         renderer.render(scene, camera);
         window.__XR8_RUN__ = true;
       },
+      stop() {
+        window.__XR8_STOP_COUNT__ = (window.__XR8_STOP_COUNT__ || 0) + 1;
+      },
     };
   });
 
-  await page.goto('/?signal=off');
+  await page.goto('/?signal=off&vehicle=toy-car-1');
   const cameraButton = page.locator('#eighthwall-btn');
   await expect(cameraButton).toBeEnabled();
   await cameraButton.click();
   await page.waitForFunction(() => window.__XR8_RUN__ === true);
 
   await expect(page.locator('#hud')).toBeVisible();
+  await page.waitForFunction(() => (
+    window.XRRC_DIAGNOSTICS?.snapshot().localVehicleRender.modelStatus === 'ready'
+  ));
+  const diagnostics = await page.evaluate(() => window.XRRC_DIAGNOSTICS.snapshot());
+  expect(diagnostics.xrScale).toBeCloseTo(0.4, 5);
+  expect(diagnostics.localVehicleRender.bounds.x).toBeGreaterThan(0.09);
+  expect(diagnostics.localVehicleRender.bounds.z).toBeGreaterThan(0.18);
   expect(await page.evaluate(() => window.__XR8_MODULES__.map((module) => module.name)))
     .toEqual([
       'gl-texture-renderer',
@@ -73,4 +83,14 @@ test('starts the complete 8th Wall pipeline with camera runtime modules', async 
       'runtime-error',
       'xrrc',
     ]);
+
+  await page.waitForFunction(() => (
+    window.XRRC_DIAGNOSTICS?.snapshot().race.status === 'racing'
+  ));
+  await page.evaluate(() => document.dispatchEvent(new CustomEvent('game-pause')));
+  await page.locator('#quit-btn').click();
+
+  await expect(page.locator('#lobby')).toBeVisible();
+  await expect(cameraButton).toBeEnabled();
+  expect(await page.evaluate(() => window.__XR8_STOP_COUNT__)).toBe(1);
 });
