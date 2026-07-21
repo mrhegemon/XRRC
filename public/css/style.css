@@ -416,6 +416,8 @@ label {
 .signal-content label,
 .track-field legend,
 .kit-field legend,
+.dream-field legend,
+.dream-block label,
 .vehicle-field legend {
   color: var(--paper-deep);
   font-size: 0.72rem;
@@ -438,7 +440,8 @@ label {
 }
 
 .input-shell input,
-.signal-row input {
+.signal-row input,
+.dream-row input {
   width: 100%;
   min-width: 0;
   border: 0;
@@ -2895,3 +2898,135 @@ kbd {
     transform: none;
   }
 }
+
+/* -- Dream lab (Tripo AI generation) ------------------------------------ */
+.dream-field {
+  margin-top: 1rem;
+  border: 0;
+}
+
+.dream-field legend {
+  margin-bottom: 0.4rem;
+}
+
+.dream-block {
+  margin-top: 0.75rem;
+}
+
+.dream-block:first-of-type {
+  margin-top: 0.3rem;
+}
+
+.dream-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  margin-top: 0.35rem;
+  border-bottom: 2px solid var(--paper-deep);
+  background: rgb(244 234 210 / 7%);
+}
+
+.dream-row:focus-within {
+  border-color: var(--yellow);
+}
+
+.dream-row input {
+  padding: 0.55rem 0.65rem;
+  font-size: 0.82rem;
+}
+
+.dream-row .check-btn:disabled {
+  cursor: progress;
+  opacity: 0.55;
+}
+
+.dream-status {
+  display: block;
+  min-height: 1rem;
+  margin-top: 0.3rem;
+  color: rgb(244 234 210 / 58%);
+  font-size: 0.73rem;
+  line-height: 1.25;
+}
+
+.dream-status[data-state="error"] {
+  color: var(--yellow);
+}
+
+.dream-status[data-state="done"] {
+  color: var(--mint);
+}
+
+.dream-preview {
+  display: grid;
+  margin-top: 0.55rem;
+  padding: 0.4rem 0.4rem 0.55rem;
+  border: 1px solid rgb(244 234 210 / 17%);
+  background: rgb(244 234 210 / 4%);
+  justify-items: center;
+}
+
+.dream-preview canvas {
+  width: 100%;
+  max-width: 20rem;
+  height: auto;
+}
+
+.dream-caption {
+  margin: 0.25rem 0 0;
+  color: var(--paper);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.dream-prop-strip {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.55rem;
+  margin-top: 0.55rem;
+}
+
+.dream-prop {
+  display: grid;
+  gap: 0.3rem;
+  padding: 0.4rem;
+  border: 1px solid rgb(244 234 210 / 17%);
+  background: rgb(244 234 210 / 4%);
+  justify-items: center;
+  text-align: center;
+}
+
+.dream-prop img {
+  width: 100%;
+  aspect-ratio: 1;
+  object-fit: cover;
+  background: rgb(36 37 31 / 72%);
+}
+
+.dream-prop strong {
+  color: var(--paper);
+  font-size: 0.68rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.dream-prop small {
+  color: rgb(244 234 210 / 58%);
+  font-size: 0.66rem;
+}
+
+.dream-prop.is-ready {
+  border-color: var(--yellow);
+}
+
+.vehicle-glyph.thumb-glyph {
+  background-position: center;
+  background-size: cover;
+}
+
+.vehicle-glyph.thumb-glyph::before,
+.vehicle-glyph.thumb-glyph::after {
+  content: none;
+}
+

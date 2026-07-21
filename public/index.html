@@ -276,6 +276,11 @@
                   <span class="vehicle-glyph" aria-hidden="true"></span>
                   <strong>Coupe</strong>
                 </label>
+                <label class="vehicle-toggle">
+                  <input type="radio" name="vehicle" value="car2" />
+                  <span class="vehicle-glyph" aria-hidden="true"></span>
+                  <strong data-i18n="vehicle.car2">Rally GT</strong>
+                </label>
               </div>
               <div
                 id="vehicle-profile"
@@ -341,6 +346,58 @@
                     ><span aria-hidden="true"></span></dd>
                   </div>
                 </dl>
+              </div>
+            </fieldset>
+
+            <fieldset class="dream-field" id="dream-lab" hidden>
+              <legend data-i18n="dream.title">Dream lab</legend>
+              <p class="field-help" data-i18n="dream.hint">
+                AI-built by Tripo while you wait for friends to join.
+              </p>
+              <div class="dream-block">
+                <label for="dream-vehicle-input" data-i18n="dream.vehicleLabel">Invent a vehicle</label>
+                <div class="dream-row">
+                  <input
+                    id="dream-vehicle-input"
+                    type="text"
+                    maxlength="120"
+                    autocomplete="off"
+                    spellcheck="false"
+                    placeholder="banana speedster with fins"
+                  />
+                  <button id="dream-vehicle-btn" class="check-btn" type="button" data-i18n="dream.generate">
+                    Generate
+                  </button>
+                </div>
+                <output id="dream-vehicle-status" class="dream-status" aria-live="polite"></output>
+                <div id="dream-vehicle-preview" class="dream-preview" hidden>
+                  <canvas
+                    id="dream-plate-canvas"
+                    width="320"
+                    height="210"
+                    aria-label="Generated vehicle on a spinning display plate"
+                    data-i18n-aria-label="dream.plateAria"
+                  ></canvas>
+                  <p id="dream-vehicle-name" class="dream-caption"></p>
+                </div>
+              </div>
+              <div class="dream-block">
+                <label for="dream-map-input" data-i18n="dream.mapLabel">Theme the map</label>
+                <div class="dream-row">
+                  <input
+                    id="dream-map-input"
+                    type="text"
+                    maxlength="120"
+                    autocomplete="off"
+                    spellcheck="false"
+                    placeholder="haunted pumpkin swamp"
+                  />
+                  <button id="dream-map-btn" class="check-btn" type="button" data-i18n="dream.generate">
+                    Generate
+                  </button>
+                </div>
+                <output id="dream-map-status" class="dream-status" aria-live="polite"></output>
+                <div id="dream-prop-strip" class="dream-prop-strip" hidden></div>
               </div>
             </fieldset>
 
@@ -726,6 +783,7 @@
     <script src="js/i18n.js"></script>
     <script src="js/share-core.js"></script>
     <script src="js/track-core.js"></script>
+    <script src="js/tripo-core.js"></script>
     <script src="js/game-core.js"></script>
     <script src="js/race-core.js"></script>
     <script src="js/controls-core.js"></script>

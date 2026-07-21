@@ -18,6 +18,7 @@ const glbVehicles = {
   'toy-car-taxi': 'Taxi',
   'toy-car-cop': 'Police',
   car1: 'Coupe',
+  car2: 'Rally GT',
 };
 const allVehicles = { ...proceduralVehicles, ...glbVehicles };
 const vehicleRoles = {
@@ -34,6 +35,7 @@ const vehicleRoles = {
   'toy-car-taxi': 'City cab shell',
   'toy-car-cop': 'Pursuit shell',
   car1: 'Sport coupe shell',
+  car2: 'Rally GT shell',
 };
 const expectedVehicleParts = {
   rally: { rotors: 0, wheels: 4 },
@@ -90,8 +92,8 @@ test('renders every procedural vehicle within the scene budget', async ({ page }
   expect(pageErrors).toEqual([]);
 });
 
-test('loads, drives, resets, and recalls all 13 vehicle types', async ({ page }) => {
-  // Cycles all 13 vehicles, which pulls roughly 12MB of GLB skins through the
+test('loads, drives, resets, and recalls all 14 vehicle types', async ({ page }) => {
+  // Cycles all 14 vehicles, which pulls roughly 13MB of GLB skins through the
   // loader. That is comfortably the slowest test in the suite and it has to
   // finish on a CI runner doing software rendering.
   test.setTimeout(300_000);
@@ -100,7 +102,7 @@ test('loads, drives, resets, and recalls all 13 vehicle types', async ({ page })
   await page.goto('/?signal=off&mode=desktop&vehicle=rally&rivals=0');
   await waitForRenderedGame(page);
   await expect(page.locator('#countdown')).toHaveText('', { timeout: 6_000 });
-  await expect(page.locator('#vehicle-bay .vehicle-slot')).toHaveCount(13);
+  await expect(page.locator('#vehicle-bay .vehicle-slot')).toHaveCount(14);
 
   for (const [vehicle, label] of Object.entries(allVehicles)) {
     await test.step(label, async () => {

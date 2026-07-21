@@ -23,6 +23,7 @@ const vehicles = [
   'toy-car-taxi',
   'toy-car-cop',
   'car1',
+  'car2',
 ];
 
 async function waitForServer() {

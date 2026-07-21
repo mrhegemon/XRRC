@@ -5,9 +5,10 @@
 
 XRRC is a static-first Three.js RC racing game for desktop, mobile, private
 WebRTC multiplayer, native WebXR, and 8th Wall AR. Choose one of six themed
-circuits and 13 vehicles, then race without an application backend. The optional
-Node service only handles WebRTC signaling and is designed to stay private
-behind Tailscale Serve.
+circuits and 14 vehicles, then race without an application backend. The optional
+Node service handles WebRTC signaling and, when given a Tripo API key, proxies
+on-demand AI vehicle and prop generation; it is designed to stay private behind
+Tailscale Serve.
 
 **Play:** [lab.liambroza.com/XRRC](https://lab.liambroza.com/XRRC/)
 
@@ -21,7 +22,10 @@ behind Tailscale Serve.
 - Six spline circuits with distinct racing lines, scenery, palettes, lighting,
   and trackside props - hairpins, sweepers and direction changes rather than
   six variations on an oval.
-- Seven handling classes plus six on-demand GLB rally-car skins.
+- Seven handling classes plus seven on-demand GLB rally-car skins.
+- Optional Tripo dream lab: on a Tripo-enabled server, prompt a custom
+  AI-generated vehicle and map-themed props while waiting for friends to join.
+  Stays hidden and inert on the static build.
 - Asphalt, shoulders, curbs, grid markings, four ramps, and a vertical stunt
   loop - all placed on the racing line itself, so a lap runs through them
   instead of detouring to a separate stunt strip.
@@ -42,7 +46,7 @@ behind Tailscale Serve.
 - Native immersive WebXR and an on-demand 8th Wall camera pipeline.
 - A Quest quality profile and instanced track props that keep the reference
   scene within the automated render budget.
-- 65 Node tests, 37 Playwright browser tests, CI, and deterministic screenshots.
+- 75 Node tests, 39 Playwright browser tests, CI, and deterministic screenshots.
 
 ## Visual gallery
 
@@ -77,6 +81,10 @@ behind Tailscale Serve.
 | Taxi | Police | Coupe |
 | --- | --- | --- |
 | ![Taxi on the XRRC circuit](docs/screenshots/race-toy-car-taxi.png) | ![Police car on the XRRC circuit](docs/screenshots/race-toy-car-cop.png) | ![Coupe on the XRRC circuit](docs/screenshots/race-car1.png) |
+
+| Rally GT |
+| --- |
+| ![Rally GT on the XRRC circuit](docs/screenshots/race-car2.png) |
 
 ### Localization, mobile, and multiplayer
 
@@ -183,10 +191,32 @@ rally body is shown until loading completes and remains as the fallback if an
 asset cannot be loaded. Vehicle type is included in network state, so peers
 render the same procedural model or skin.
 
-The in-race bay renders a cached thumbnail for all 13 vehicles. Selecting an
+The in-race bay renders a cached thumbnail for all 14 vehicles. Selecting an
 empty slot transfers the current race position to that vehicle and returns the
 previous vehicle to its fixed paddock stall. Selecting a parked slot recalls
 and disposes that vehicle. Selecting the active slot is a no-op.
+
+### Dream lab (Tripo AI generation)
+
+When the server is started with a `TRIPO_API_KEY`, the lobby reveals a **Dream
+lab** panel backed by the [Tripo](https://developers.tripo3d.ai) text-to-3D API.
+The client never talks to Tripo directly: the key stays on the server, user text
+is composed into guard-railed, toy-scale prompts server-side, and generated GLB
+binaries are streamed back through `/api/tripo/model/:taskId` so browsers (and
+peers) load them without CORS issues. Generation is rate-limited per client.
+
+- **Invent a vehicle** — a prompt generates a custom car that appears on a
+  spinning display plate, joins the vehicle bay as a selectable `dream-car`
+  riding the rally physics profile, and travels in network state as its task id
+  so peers on a Tripo-enabled server render the same model (others see the rally
+  fallback).
+- **Theme the map** — a second prompt generates three matching props placed on
+  fixed off-track grass anchors that scale with the circuit.
+
+Both results persist in `localStorage` and restore on the next visit while the
+Tripo tasks remain queryable. Without a key — including the static GitHub Pages
+build — the panel stays hidden and nothing else changes; the whole feature is
+inert. The client detects availability by probing `/api/tripo/status`.
 
 ### Controls
 
@@ -446,6 +476,7 @@ the public site.
 | `ALLOWED_ORIGINS` | `https://lab.liambroza.com` | `server.js` | Comma-separated browser origin allowlist |
 | `XRRC_SIGNAL_URL` | Empty | Pages workflow | Build-time default relay URL |
 | `XRRC_DEPLOYMENT.signalUrl` | Empty | Browser | Static runtime default relay URL |
+| `TRIPO_API_KEY` | Empty | `server.js` | Enables the Tripo dream lab proxy (`/api/tripo/*`) |
 
 ### URL parameters
 
@@ -467,7 +498,8 @@ the public site.
 
 Valid vehicle IDs are `rally`, `buggy`, `truck`, `motorcycle`, `tank`, `plane`,
 `helicopter`, `toy-car-1`, `toy-car-2`, `toy-car-3`, `toy-car-taxi`,
-`toy-car-cop`, and `car1`.
+`toy-car-cop`, `car1`, and `car2`. A `dream-car` becomes selectable once one is
+generated on a Tripo-enabled server.
 
 ## Performance
 
@@ -516,11 +548,12 @@ normals, and shadow state.
 | `public/js/network.js` | WebSocket signaling client plus unordered state and ordered race WebRTC channels |
 | `public/js/config.js` | Room, relay, health, and invite URL normalization |
 | `public/js/share-core.js` | Email, text, and WhatsApp invite target encoding |
+| `public/js/tripo-core.js` | Tripo prompt composition, task payloads, and task normalization |
 | `public/js/xr-core.js` | Native WebXR session and 8th Wall runtime contracts |
 | `public/js/audio.js` | Procedural music, engine, skid, cue, and impact audio |
 | `public/js/i18n.js` | English, Spanish, and French dictionaries and persistence |
 | `public/runtime-config.js` | Static-host deployment values |
-| `server.js` | Static local host, signaling relay, origin policy, and health endpoint |
+| `server.js` | Static local host, signaling relay, origin policy, health endpoint, and Tripo proxy |
 | `test/` | Node unit and integration tests |
 | `e2e/` | Playwright gameplay, mobile, XR, performance, and WebRTC tests |
 | `scripts/capture-screenshots.js` | Deterministic desktop, mobile, vehicle, and two-peer captures |
@@ -542,7 +575,7 @@ npx playwright install chromium
 | --- | --- |
 | `npm start` | Start the static app and signaling service |
 | `npm run check:syntax` | Parse-check the server and browser JavaScript |
-| `npm test` | Run 65 Node tests |
+| `npm test` | Run 75 Node tests |
 | `npm run check` | Run syntax checks and Node tests |
 | `npm run test:e2e` | Run 35 Chromium browser tests |
 | `npm run test:e2e:update` | Update Playwright snapshots if added later |
