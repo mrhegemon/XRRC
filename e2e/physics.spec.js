@@ -200,12 +200,40 @@ test('the running game classifies and reports off-road terrain', async ({ page }
 });
 
 test('vehicle collisions ignore vertically separated racers', async ({ page }) => {
+  // The pure "collide only when vertical ranges overlap" rule is covered
+  // deterministically in test/game-core.test.js. This proves the live resolver
+  // actually consults it. A ground vehicle dropped from altitude raced gravity -
+  // under CI load it fell into the parked car and registered the very collision
+  // the test denies - so the flyer holds altitude instead: the helicopter's
+  // flight profile has zero gravity, so it stays put no matter how slow a frame
+  // is, and the result no longer depends on timing.
   await page.goto('/?signal=off&mode=desktop&track=backyard&vehicle=rally&rivals=0');
   await waitForRace(page);
-  await page.evaluate(() => window.XRRC_DIAGNOSTICS.summonVehicle('buggy'));
+  await page.evaluate(() => window.XRRC_DIAGNOSTICS.summonVehicle('helicopter'));
   await expect.poll(async () => (
     page.evaluate(() => window.XRRC_DIAGNOSTICS.snapshot().localVehicle)
-  )).toBe('buggy');
+  )).toBe('helicopter');
+
+  // Settle N frames, then report the flyer's state relative to the parked car.
+  const settle = (frames) => page.evaluate((count) => new Promise((resolve) => {
+    let seen = 0;
+    const tick = () => {
+      if (seen++ < count) {
+        requestAnimationFrame(tick);
+        return;
+      }
+      const snapshot = window.XRRC_DIAGNOSTICS.snapshot();
+      const parked = snapshot.worldVehicleStates.find(({ type }) => type === 'rally');
+      resolve({
+        airborne: snapshot.localVehicleRender.airborne,
+        drift: Math.hypot(
+          snapshot.localVehiclePosition.x - parked.position.x,
+          snapshot.localVehiclePosition.z - parked.position.z
+        ),
+      });
+    };
+    requestAnimationFrame(tick);
+  }), frames);
 
   const parked = await page.evaluate(() => {
     window.XRRC_DIAGNOSTICS.setCourseProgress(0.5);
@@ -215,9 +243,11 @@ test('vehicle collisions ignore vertically separated racers', async ({ page }) =
       y: 0.035,
       z: position.z,
     });
+    // Park the flyer well above the ground car: their vertical ranges do not
+    // overlap, so the resolver must leave it in place.
     window.XRRC_DIAGNOSTICS.setLocalVehicleState({
       x: position.x,
-      y: 2,
+      y: 1.5,
       z: position.z,
       velocity: 0,
       verticalVelocity: 0,
@@ -225,56 +255,25 @@ test('vehicle collisions ignore vertically separated racers', async ({ page }) =
     return window.XRRC_DIAGNOSTICS.snapshot()
       .worldVehicleStates.find(({ type }) => type === 'rally');
   });
-  // Hold the car at altitude for the duration of the check instead of letting
-  // it fall. Waiting a wall-clock window (or even a frame count) raced gravity:
-  // on a loaded machine the simulation advanced far enough for the car to land
-  // and register the very collision this test asserts cannot happen. Pinning y
-  // each frame leaves x/z free, so a knockback would still show up - it just
-  // removes the timing dependence entirely.
-  const separatedVertically = await page.evaluate(() => new Promise((resolve) => {
-    let frames = 0;
-    const tick = () => {
-      const snapshot = window.XRRC_DIAGNOSTICS.snapshot();
-      const position = snapshot.localVehiclePosition;
-      if (frames++ < 8) {
-        window.XRRC_DIAGNOSTICS.setLocalVehicleState({
-          x: position.x,
-          y: 2,
-          z: position.z,
-          velocity: 0,
-          verticalVelocity: 0,
-        });
-        requestAnimationFrame(tick);
-        return;
-      }
-      resolve({ ...position, airborne: snapshot.localVehicleRender.airborne });
-    };
-    requestAnimationFrame(tick);
-  }));
-  // The separation premise only holds while the car is still above the other.
-  expect(separatedVertically.airborne).toBe(true);
-  expect(Math.hypot(
-    separatedVertically.x - parked.position.x,
-    separatedVertically.z - parked.position.z
-  )).toBeLessThan(0.02);
 
+  const separated = await settle(12);
+  expect(separated.airborne).toBe(true);
+  expect(separated.drift).toBeLessThan(0.02);
+
+  // Drop the flyer to the ground car's height so the ranges overlap, and the
+  // resolver must now knock it clear.
   await page.evaluate((position) => {
     window.XRRC_DIAGNOSTICS.setLocalVehicleState({
       x: position.x,
-      y: 0.045,
+      y: 0.08,
       z: position.z,
-      velocity: 0,
+      velocity: 0.3,
       verticalVelocity: 0,
     });
   }, parked.position);
-  await page.waitForTimeout(100);
-  const collidedOnGround = await page.evaluate(() => (
-    window.XRRC_DIAGNOSTICS.snapshot().localVehiclePosition
-  ));
-  expect(Math.hypot(
-    collidedOnGround.x - parked.position.x,
-    collidedOnGround.z - parked.position.z
-  )).toBeGreaterThan(0.02);
+
+  const overlapping = await settle(12);
+  expect(overlapping.drift).toBeGreaterThan(0.02);
 });
 
 test('course-boundary escape recovers to the last safe road pose', async ({ page }) => {
