@@ -93,12 +93,28 @@ test('ships a live handling profile for the complete vehicle picker', () => {
     html.matchAll(/<input type="radio" name="vehicle" value="([^"]+)"/g),
     (match) => match[1]
   );
-  assert.equal(vehicleInputs.length, 13);
+  // 7 procedural classes + 7 bundled GLB skins (car2 "Rally GT" included).
+  // The dream-car is added dynamically once generated, not shipped in markup.
+  assert.equal(vehicleInputs.length, 14);
+  assert.ok(vehicleInputs.includes('car2'), 'Rally GT skin must be selectable');
   assert.match(html, /id="vehicle-profile"[\s\S]+aria-live="polite"/);
   assert.match(html, /id="vehicle-role"/);
   assert.match(html, /id="vehicle-note"/);
   assert.equal((html.match(/class="rating-meter"/g) || []).length, 4);
   assert.equal((html.match(/role="meter"/g) || []).length, 4);
+});
+
+test('loads the Tripo core module before the game module that consumes it', () => {
+  assert.ok(
+    html.includes('src="js/tripo-core.js"'),
+    'tripo-core.js must be loaded for the dream lab'
+  );
+  assert.ok(
+    html.indexOf('src="js/tripo-core.js"') < html.indexOf("await import('./js/game.js')"),
+    'Tripo core must load before the game module'
+  );
+  // The dream lab stays hidden until a Tripo-enabled server is detected.
+  assert.match(html, /id="dream-lab"[^>]*hidden/);
 });
 
 test('ships accessible race rules, pause, timing, standings, and results surfaces', () => {

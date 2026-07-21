@@ -200,12 +200,40 @@ test('the running game classifies and reports off-road terrain', async ({ page }
 });
 
 test('vehicle collisions ignore vertically separated racers', async ({ page }) => {
+  // The pure "collide only when vertical ranges overlap" rule is covered
+  // deterministically in test/game-core.test.js. This proves the live resolver
+  // actually consults it. A ground vehicle dropped from altitude raced gravity -
+  // under CI load it fell into the parked car and registered the very collision
+  // the test denies - so the flyer holds altitude instead: the helicopter's
+  // flight profile has zero gravity, so it stays put no matter how slow a frame
+  // is, and the result no longer depends on timing.
   await page.goto('/?signal=off&mode=desktop&track=backyard&vehicle=rally&rivals=0');
   await waitForRace(page);
-  await page.evaluate(() => window.XRRC_DIAGNOSTICS.summonVehicle('buggy'));
+  await page.evaluate(() => window.XRRC_DIAGNOSTICS.summonVehicle('helicopter'));
   await expect.poll(async () => (
     page.evaluate(() => window.XRRC_DIAGNOSTICS.snapshot().localVehicle)
-  )).toBe('buggy');
+  )).toBe('helicopter');
+
+  // Settle N frames, then report the flyer's state relative to the parked car.
+  const settle = (frames) => page.evaluate((count) => new Promise((resolve) => {
+    let seen = 0;
+    const tick = () => {
+      if (seen++ < count) {
+        requestAnimationFrame(tick);
+        return;
+      }
+      const snapshot = window.XRRC_DIAGNOSTICS.snapshot();
+      const parked = snapshot.worldVehicleStates.find(({ type }) => type === 'rally');
+      resolve({
+        airborne: snapshot.localVehicleRender.airborne,
+        drift: Math.hypot(
+          snapshot.localVehiclePosition.x - parked.position.x,
+          snapshot.localVehiclePosition.z - parked.position.z
+        ),
+      });
+    };
+    requestAnimationFrame(tick);
+  }), frames);
 
   const parked = await page.evaluate(() => {
     window.XRRC_DIAGNOSTICS.setCourseProgress(0.5);
@@ -215,9 +243,11 @@ test('vehicle collisions ignore vertically separated racers', async ({ page }) =
       y: 0.035,
       z: position.z,
     });
+    // Park the flyer well above the ground car: their vertical ranges do not
+    // overlap, so the resolver must leave it in place.
     window.XRRC_DIAGNOSTICS.setLocalVehicleState({
       x: position.x,
-      y: 2,
+      y: 1.5,
       z: position.z,
       velocity: 0,
       verticalVelocity: 0,
@@ -225,32 +255,25 @@ test('vehicle collisions ignore vertically separated racers', async ({ page }) =
     return window.XRRC_DIAGNOSTICS.snapshot()
       .worldVehicleStates.find(({ type }) => type === 'rally');
   });
-  await page.waitForTimeout(100);
-  const separatedVertically = await page.evaluate(() => (
-    window.XRRC_DIAGNOSTICS.snapshot().localVehiclePosition
-  ));
-  expect(Math.hypot(
-    separatedVertically.x - parked.position.x,
-    separatedVertically.z - parked.position.z
-  )).toBeLessThan(0.02);
 
+  const separated = await settle(12);
+  expect(separated.airborne).toBe(true);
+  expect(separated.drift).toBeLessThan(0.02);
+
+  // Drop the flyer to the ground car's height so the ranges overlap, and the
+  // resolver must now knock it clear.
   await page.evaluate((position) => {
     window.XRRC_DIAGNOSTICS.setLocalVehicleState({
       x: position.x,
-      y: 0.045,
+      y: 0.08,
       z: position.z,
-      velocity: 0,
+      velocity: 0.3,
       verticalVelocity: 0,
     });
   }, parked.position);
-  await page.waitForTimeout(100);
-  const collidedOnGround = await page.evaluate(() => (
-    window.XRRC_DIAGNOSTICS.snapshot().localVehiclePosition
-  ));
-  expect(Math.hypot(
-    collidedOnGround.x - parked.position.x,
-    collidedOnGround.z - parked.position.z
-  )).toBeGreaterThan(0.02);
+
+  const overlapping = await settle(12);
+  expect(overlapping.drift).toBeGreaterThan(0.02);
 });
 
 test('course-boundary escape recovers to the last safe road pose', async ({ page }) => {
@@ -361,10 +384,14 @@ test('aircraft altitude controls produce real vertical movement', async ({ page 
   await expect.poll(async () => (
     page.evaluate(() => window.XRRC_DIAGNOSTICS.snapshot().localVehicleSpeed)
   ), { timeout: 5_000 }).toBeGreaterThan(0.7);
-  await page.keyboard.up('w');
+  // Read while the throttle is still down. Sampling after keyboard.up() raced
+  // the aircraft's deceleration: on a fast machine the round trip is a few
+  // milliseconds, but on a loaded CI runner enough time passes for the speed to
+  // decay back below the threshold the poll just proved it had passed.
   const flightSpeed = await page.evaluate(() => (
     window.XRRC_DIAGNOSTICS.snapshot().localVehicleSpeed
   ));
+  await page.keyboard.up('w');
   expect(flightSpeed).toBeGreaterThan(0.7);
 });
 
